@@ -3830,35 +3830,60 @@ function getStatus(userId) {
 
 async function sendResultAmountLine(chatId, userId, label, amount) {
     const balance = await getLiveBalance(userId);
-    const balanceTrack = profitTrack[userId] || {};
-    const currentLiveBalance = balance.success ? Number(balance.balance) || 0 : Number(balanceTrack.liveBalance || 0);
-    const previousSettledBalance = Number.isFinite(Number(balanceTrack.lastSettledBalance))
-        ? Number(balanceTrack.lastSettledBalance)
-        : Number(balanceTrack.startBalance || currentLiveBalance);
-    const balanceDelta = currentLiveBalance - previousSettledBalance;
-    if (balance.success) {
-        if (balanceDelta > 0) balanceTrack.liveWinnings = (Number(balanceTrack.liveWinnings) || 0) + balanceDelta;
-        if (balanceDelta < 0) balanceTrack.liveLossAmount = (Number(balanceTrack.liveLossAmount) || 0) + Math.abs(balanceDelta);
-        balanceTrack.lastSettledBalance = currentLiveBalance;
-        balanceTrack.pnl = currentLiveBalance - Number(balanceTrack.startBalance || currentLiveBalance);
-        balanceTrack.lastPeriodLiveDelta = balanceDelta;
-    }
-    const pnl = Number(balanceTrack.pnl || 0);
-    const balanceText = balance.success
-        ? "₹" + Number(currentLiveBalance).toFixed(2)
-        : "Unavailable";
-    const sign = label === "Profit" ? "+" : "-";
-    const liveNet = Number(profitTrack[userId]?.liveNet || 0);
-    const totalWin = Number(balanceTrack.liveWinnings ?? balanceTrack.totalWinProfit ?? 0);
-    const totalLoss = Number(balanceTrack.liveLossAmount ?? balanceTrack.totalLossAmount ?? 0);
-    await send(chatId, label + ": " + sign + "₹" + Math.floor(Math.abs(Number(amount) || 0)) +
-        " | Period: " + (balanceTrack.lastPeriodLiveDelta >= 0 ? "+" : "-") + "₹" + Math.abs(Number(balanceTrack.lastPeriodLiveDelta || 0)).toFixed(2) +
-        " | Live Balance: " + balanceText +
-        " | Live Net: " + (liveNet >= 0 ? "+" : "-") + "₹" + Math.floor(Math.abs(liveNet)) +
-        " | Total Profit: " + (pnl >= 0 ? "+" : "-") + "₹" + Math.floor(Math.abs(pnl)) +
-        " | Winnings: +₹" + Math.floor(totalWin) + " | Loss Total: -₹" + Math.floor(totalLoss));
-}
+    const pt = profitTrack[userId] || {};
+    const currentLiveBalance = balance.success ? Number(balance.balance) || 0 : Number(pt.liveBalance || 0);
+    const snapshot = pt.activeBetSnapshot || {};
+    const investment = Number(snapshot.investment || amount || 0);
+    const beforeBalance = Number.isFinite(Number(snapshot.beforeBalance))
+        ? Number(snapshot.beforeBalance)
+        : currentLiveBalance;
+    const netDelta = currentLiveBalance - beforeBalance;
 
+    // Gross winnings are the amount credited after the stake was invested.
+    // Net profit is gross winnings minus the investment.
+    const grossWinnings = label === 'Profit'
+        ? Math.max(0, netDelta + investment)
+        : 0;
+    const lossAmount = label === 'Loss'
+        ? Math.max(0, -netDelta)
+        : 0;
+    const netProfit = label === 'Profit'
+        ? grossWinnings - investment
+        : -lossAmount;
+
+    if (balance.success) {
+        pt.lastSettledBalance = currentLiveBalance;
+        pt.liveBalance = currentLiveBalance;
+        pt.liveNet = currentLiveBalance - Number(pt.startBalance || currentLiveBalance);
+        pt.pnl = pt.liveNet;
+        pt.lastPeriodLiveDelta = netProfit;
+        pt.lastInvestment = investment;
+        pt.lastGrossWinnings = grossWinnings;
+        pt.lastLossAmount = lossAmount;
+        if (label === 'Profit') pt.liveWinnings = (Number(pt.liveWinnings) || 0) + grossWinnings;
+        if (label === 'Loss') pt.liveLossAmount = (Number(pt.liveLossAmount) || 0) + lossAmount;
+    }
+
+    const totalWinnings = Number(pt.liveWinnings || 0);
+    const totalLoss = Number(pt.liveLossAmount || 0);
+    const sign = netProfit >= 0 ? '+' : '-';
+    const balanceText = balance.success ? '₹' + currentLiveBalance.toFixed(2) : 'Unavailable';
+    const title = label === 'Profit' ? '✅ WINNINGS' : '❌ LOSS';
+    const periodText = label === 'Profit'
+        ? `Winnings: +₹${grossWinnings.toFixed(2)}\nProfit: ${sign}₹${Math.abs(netProfit).toFixed(2)}`
+        : `Loss: -₹${lossAmount.toFixed(2)}\nProfit: -₹${lossAmount.toFixed(2)}`;
+
+    await send(chatId,
+        title + '\n' +
+        `Investment: ₹${investment.toFixed(2)}\n` +
+        periodText + '\n' +
+        `Live Balance: ${balanceText}\n` +
+        `Total Winnings: +₹${totalWinnings.toFixed(2)}\n` +
+        `Total Profit: ${pt.liveNet >= 0 ? '+' : '-'}₹${Math.abs(Number(pt.liveNet || 0)).toFixed(2)}\n` +
+        `Total Loss: -₹${totalLoss.toFixed(2)}`);
+
+    delete pt.activeBetSnapshot;
+}
 // ============================================================
 // 2. handleWin - UI & Stats
 // ============================================================
@@ -4125,6 +4150,12 @@ waitLine+"\n"+
 
     let placedBets = [];
     if (canBet) {
+        const preBetBalance = await getLiveBalance(userId);
+        profitTrack[userId].activeBetSnapshot = {
+            period: String(next),
+            beforeBalance: preBetBalance.success ? Number(preBetBalance.balance) : null,
+            investment: 0
+        };
         const rawSpecs = signal.bets || [{ type: signal.type, val: signal.val, kind: signal.type === "NUMBER" ? "number" : "size" }];
         // Enforce exactly one SIZE and one NUMBER for each period in COMBINED mode.
         const sizeSpec = rawSpecs.find(spec => spec.type === "SIZE");
@@ -4144,13 +4175,17 @@ waitLine+"\n"+
                 ? (isNumber ? combinedAmounts.number : combinedAmounts.size)
                 : (sequence[levelForBet - 1] ?? (cfg.baseBet * (MULT[levelForBet - 1] || 1)));
             const result = await placeBet(userId, chatId, next, spec.val, spec.type, levelForBet, amount);
-            if (result && result.ok) placedBets.push({ ...spec, amt: result.amt, level: levelForBet });
+            if (result && result.ok) {
+                placedBets.push({ ...spec, amt: result.amt, level: levelForBet });
+                profitTrack[userId].activeBetSnapshot.investment += Number(result.amt || 0);
+            }
             else await send(chatId, "❌ Bet Failed (" + spec.type + "): " + (result?.msg || "Unknown error"));
         }
         if (cfg.mode === "COMBINED" && placedBets.length !== 2) {
             // Never treat a partial combined pair as a valid combined settlement.
             await send(chatId, "⚠️ Combined bet incomplete for period " + next + ". Expected exactly 1 size + 1 number; settlement will use only the confirmed stake.");
         }
+        if (!placedBets.length) delete profitTrack[userId].activeBetSnapshot;
         if (placedBets.length) {
             const levelText = cfg.mode === "COMBINED"
                 ? "Size L" + combinedAmounts.sizeLevel + " / Number L" + combinedAmounts.numberLevel
@@ -5182,7 +5217,7 @@ if(text==="🔢 Set Watch Losses"){
             predictionDispatches.set(String(id), new Set());
             settledPeriods.delete(String(id));
             autobetState[id]={...(autobetState[id]||{}),level:1,sizeLevel:1,numberLevel:1,consecutiveLoss:0,inMart:false,lastWinLevel:null,lastWinMode:null,waitingForWatchWin:false,watchWinStreak:0,lastOutcome:null};
-            if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].lastSettledBalance = null; profitTrack[id].liveNet = 0; profitTrack[id].pnl = 0; profitTrack[id].liveWinnings = 0; profitTrack[id].liveLossAmount = 0; profitTrack[id].lastPeriodLiveDelta = 0; profitTrack[id].lastPeriodProfit = 0; }
+            if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].lastSettledBalance = null; profitTrack[id].activeBetSnapshot = null; profitTrack[id].liveNet = 0; profitTrack[id].pnl = 0; profitTrack[id].liveWinnings = 0; profitTrack[id].liveLossAmount = 0; profitTrack[id].lastPeriodLiveDelta = 0; profitTrack[id].lastPeriodProfit = 0; }
             // Capture the real wallet before the first bet, so live-net P&L
             // starts from the actual balance (for example ₹500.00).
             await getLiveBalance(id);
