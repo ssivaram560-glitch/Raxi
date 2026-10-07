@@ -912,6 +912,11 @@ const MAX_LEVEL_HISTORY = 10;
 // consecutive WATCH predictions WIN. The next period after the 2nd watch WIN
 // is the first period where a live bet is allowed again.
 const REQUIRED_WATCH_WINS = 2;
+function getRequiredWatchWins(userId) {
+    const configured = Number(autobetCfg[userId]?.watchWins);
+    return Number.isInteger(configured) && configured >= 1 && configured <= 20
+        ? configured : REQUIRED_WATCH_WINS;
+}
 let consecutiveSkipRemaining = 0;
 let consecutiveSkipTriggerKey = null;
 
@@ -1316,153 +1321,158 @@ function analyze24kHistory(fullHistory, latestNumber, currentSize, currentColor)
 
 async function getCombinedSourcePrediction(list, userId) {
     const latest = Array.isArray(list) && list[0];
-    const n = Number.parseInt(String(latest?.number ?? ''), 10);
-    if (!latest || !Number.isInteger(n) || n < 0 || n > 9) {
-        return { skip: true, reason: 'One-minute source returned no valid latest result' };
+    const latestNumber = Number.parseInt(String(latest?.number ?? ''), 10);
+    if (!latest || !Number.isInteger(latestNumber) || latestNumber < 0 || latestNumber > 9) {
+        return { skip: true, reason: '30-second history returned no valid latest result' };
     }
 
-    // Use the requested ensemble for the SIZE leg. If history is too short,
-    // retain the original supplied Netlify mapping as a deterministic fallback.
-    const mapping = ['BIG', 'BIG', 'SMALL', 'SMALL', 'SMALL', 'BIG', 'SMALL', 'SMALL', 'SMALL', 'BIG'];
-    const sourceSize = mapping[n];
-    const ensemble = getCombinedEnsembleSize(list);
-    let size = ensemble?.side || sourceSize;
-    let oppositePool = size === 'BIG' ? [0, 1, 2, 3, 4] : [5, 6, 7, 8, 9];
-    const cacheKey = `${String(latest.issueNumber ?? latest.issue)}:${n}:${size}`;
-    if (getCombinedSourcePrediction._cache?.key === cacheKey) {
-        return getCombinedSourcePrediction._cache.signal;
-    }
-    const fullHistory = await fetchLuciferFullHistory();
-    if (fullHistory.length < 2) {
-        return { skip: true, reason: 'Lucifer full history unavailable for shared number selection' };
-    }
+    // This is a direct server-side port of the supplied HTML logic:
+    // full history + last-10 context + 10/7/5/4/3 sequence matching,
+    // transition, run-length, recent distribution and colour-run cross-signal.
+    const fetched = await fetchLuciferOldHistoryForAnalysis();
+    const source = fetched.length >= 30 ? fetched : (Array.isArray(list) ? list : []);
+    const rows = source.map(item => ({
+        number: getResultNumber(item),
+        issue: String(item?.issueNumber ?? item?.issue ?? item?.period ?? ''),
+        timestamp: Number(item?.timestamp) || 0
+    })).filter(item => Number.isInteger(item.number) && item.number >= 0 && item.number <= 9);
+    if (rows.length < 4) return { skip: true, reason: 'Not enough 30-second history for HTML model' };
 
-    const currentSize = String(latest?.size || getSizeFromNumber(n)).toUpperCase();
-    const currentColor = String(latest?.color || '').split(',')[0].toUpperCase();
-    const deepAnalysis = analyze24kHistory(fullHistory, n, currentSize, currentColor);
-    if (deepAnalysis?.size) {
-        size = deepAnalysis.size;
-        oppositePool = size === 'BIG' ? [0, 1, 2, 3, 4] : [5, 6, 7, 8, 9];
+    const N = rows.length;
+    const getSide = n => Number(n) >= 5 ? 'BIG' : 'SMALL';
+    const getColor = n => [0, 2, 4, 6, 8].includes(Number(n)) ? 'RED' : 'GREEN';
+    const pct = (a, b) => b ? a / b : 0.5;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const lastNum = rows[0].number;
+    const lastSize = getSide(lastNum);
+    const mapCore = { 9:'BIG', 8:'SMALL', 7:'SMALL', 6:'SMALL', 5:'BIG', 4:'SMALL', 3:'SMALL', 2:'SMALL', 1:'BIG', 0:'BIG' };
+    const core = mapCore[lastNum] || null;
+
+    let big = 0, small = 0, red = 0, green = 0;
+    for (const row of rows) {
+        if (getSide(row.number) === 'BIG') big++; else small++;
+        if (getColor(row.number) === 'RED') red++; else green++;
     }
-    const netlifySizeForNumber = number => mapping[Number(number)];
-    const poolForNumber = number => netlifySizeForNumber(number) === 'BIG'
-        ? [0, 1, 2, 3, 4] : [5, 6, 7, 8, 9];
-    const contextMatches = (row, rule, targetSize, targetColor) => {
-        if (rule === 'EXACT-SIZE-COLOR') return row.size === targetSize && row.color === targetColor;
-        if (rule === 'SIZE-ONLY') return row.size === targetSize;
-        if (rule === 'COLOR-ONLY') return row.color === targetColor;
-        return true;
-    };
-    const findNearestPrediction = (index, rule) => {
-        const target = fullHistory[index];
-        const pool = poolForNumber(target.number);
-        // Keep one record between the target and its historical match so the
-        // target itself can never be counted as the match's future outcome.
-        for (let olderIndex = index + 2; olderIndex < fullHistory.length; olderIndex++) {
-            const older = fullHistory[olderIndex];
-            const following = fullHistory[olderIndex - 1];
-            if (!following || !pool.includes(following.number)) continue;
-            if (contextMatches(older, rule, target.size, target.color)) return following.number;
+    const priorBig = pct(big + 1, N + 2);
+    const priorRed = pct(red + 1, N + 2);
+
+    let transBig = 0, transSmall = 0, transTotal = 0;
+    for (let i = 1; i < N; i++) {
+        if (getSide(rows[i].number) !== lastSize) continue;
+        transTotal++;
+        if (getSide(rows[i - 1].number) === 'BIG') transBig++; else transSmall++;
+    }
+    const transitionBig = transTotal ? pct(transBig + 1, transTotal + 2) : priorBig;
+
+    let runLen = 1;
+    while (runLen < N && getSide(rows[runLen].number) === lastSize) runLen++;
+    let runBig = 0, runSmall = 0, runTotal = 0;
+    for (let i = 0; i < N - 1; i++) {
+        const side = getSide(rows[i].number);
+        let L = 1;
+        while (i + L < N && getSide(rows[i + L].number) === side) L++;
+        if (L !== runLen || i + L >= N) continue;
+        runTotal++;
+        if (getSide(rows[i + L].number) === 'BIG') runBig++; else runSmall++;
+    }
+    const runBigP = runTotal ? pct(runBig + 1, runTotal + 2) : transitionBig;
+
+    const lengths = [10, 7, 5, 4, 3];
+    let weightedBig = 0, weightedTotal = 0, bestHits = 0, bestLen = 0;
+    for (const L of lengths) {
+        if (N <= L) continue;
+        const pattern = rows.slice(0, L).map(r => r.number).reverse().join('');
+        let hits = 0, b = 0;
+        for (let i = L; i < N; i++) {
+            let candidate = '';
+            for (let k = L - 1; k >= 0; k--) candidate += rows[i - k].number;
+            if (candidate !== pattern) continue;
+            hits++;
+            if (getSide(rows[i - L].number) === 'BIG') b++;
         }
-        return null;
-    };
-
-    // Lightweight online ML candidate. It learns a multiclass score for each
-    // number from period/result/size/colour features, then is evaluated in
-    // chronological walk-forward order before being allowed to win selection.
-    const mlFeatures = row => {
-        const digits = String(row.issueNumber || '').replace(/\D/g, '');
-        return [
-            1,
-            (Number.parseInt(digits.slice(-3), 10) || 0) / 999,
-            (Number.parseInt(digits.slice(-1), 10) || 0) / 9,
-            row.number / 9,
-            row.size === 'BIG' ? 1 : -1,
-            row.color === 'RED' ? 1 : -1
-        ];
-    };
-    const dot = (weights, features) => weights.reduce((sum, value, i) => sum + value * features[i], 0);
-    const mlWeights = Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => [n, [0, 0, 0, 0, 0, 0]]));
-    let mlTested = 0;
-    let mlHits = 0;
-    for (let index = fullHistory.length - 1; index >= 2; index--) {
-        const target = fullHistory[index];
-        const actual = fullHistory[index - 1]?.number;
-        const pool = poolForNumber(target.number);
-        if (!pool.includes(actual)) continue;
-        const features = mlFeatures(target);
-        const predicted = pool.slice().sort((a, b) => dot(mlWeights[b], features) - dot(mlWeights[a], features) || a - b)[0];
-        mlTested++;
-        if (predicted === actual) mlHits++;
-        if (predicted !== actual) {
-            for (let i = 0; i < features.length; i++) {
-                mlWeights[actual][i] += features[i];
-                mlWeights[predicted][i] -= features[i];
-            }
+        if (hits > bestHits) { bestHits = hits; bestLen = L; }
+        if (hits > 0) {
+            const reliability = Math.min(1, hits / 12);
+            const weight = (L / 10) * (0.35 + 0.65 * reliability);
+            weightedBig += ((b + 1) / (hits + 2)) * weight;
+            weightedTotal += weight;
         }
     }
-    const currentFeatures = mlFeatures({
-        issueNumber: latest.issueNumber ?? latest.issue,
-        number: n,
-        size: currentSize,
-        color: currentColor
-    });
-    const mlNumber = oppositePool.slice().sort((a, b) =>
-        dot(mlWeights[b], currentFeatures) - dot(mlWeights[a], currentFeatures) || a - b
-    )[0];
+    const patternBig = weightedTotal ? weightedBig / weightedTotal : priorBig;
+    const recentBigP = windowSize => {
+        const M = Math.min(windowSize, N);
+        let b = 0;
+        for (let i = 0; i < M; i++) if (getSide(rows[i].number) === 'BIG') b++;
+        return pct(b + 1, M + 2);
+    };
+    const recent20 = recentBigP(20);
+    const recent50 = recentBigP(50);
+    let scoreBig = 0.30 * patternBig + 0.24 * runBigP + 0.20 * transitionBig +
+        0.12 * recent20 + 0.08 * recent50 + 0.06 * priorBig;
 
-    // Select the rule that performed best in a walk-forward test. This avoids
-    // choosing a number merely because it appeared most often overall.
-    const rules = ['EXACT-SIZE-COLOR', 'SIZE-ONLY', 'COLOR-ONLY', 'RECENT-POOL'];
-    const reports = rules.map(rule => {
-        let tested = 0;
-        let hits = 0;
-        const limit = fullHistory.length - 1;
-        for (let index = 1; index < limit; index++) {
-            const predicted = rule === 'RECENT-POOL'
-                ? findNearestPrediction(index, 'RECENT-POOL')
-                : findNearestPrediction(index, rule);
-            if (predicted === null) continue;
-            tested++;
-            if (predicted === fullHistory[index - 1].number) hits++;
+    // Historical colour-run -> next-size cross signal, capped as in the HTML.
+    let colorRunLen = 1;
+    while (colorRunLen < N && getColor(rows[colorRunLen].number) === getColor(rows[0].number)) colorRunLen++;
+    let colorRunBig = 0, colorRunTotal = 0;
+    if (colorRunLen >= 4) {
+        for (let i = 0; i < N - 1; i++) {
+            const color = getColor(rows[i].number);
+            let L = 1;
+            while (i + L < N && getColor(rows[i + L].number) === color) L++;
+            if (L !== colorRunLen || i + L >= N) continue;
+            colorRunTotal++;
+            if (getSide(rows[i + L].number) === 'BIG') colorRunBig++;
         }
-        return { rule, tested, hits, rate: tested ? hits / tested : 0 };
-    });
-    reports.push({ rule: 'ML-PERCEPTRON', tested: mlTested, hits: mlHits, rate: mlTested ? mlHits / mlTested : 0, mlNumber });
-    reports.sort((a, b) => b.rate - a.rate || b.tested - a.tested || a.rule.localeCompare(b.rule));
+        if (colorRunTotal > 0) {
+            const colorRunBigP = pct(colorRunBig + 1, colorRunTotal + 2);
+            const crossWeight = Math.min(0.14, 0.035 * Math.min(colorRunTotal, 4));
+            scoreBig = (1 - crossWeight) * scoreBig + crossWeight * colorRunBigP;
+        }
+    }
+    scoreBig = clamp(scoreBig, 0.05, 0.95);
+    const finalSize = scoreBig >= 0.5 ? 'BIG' : 'SMALL';
+    const sizeConfidence = Math.round(Math.max(scoreBig, 1 - scoreBig) * 100);
 
-    const selectedRule = reports[0];
-    const selectedNumber = selectedRule?.rule === 'ML-PERCEPTRON'
-        ? selectedRule.mlNumber
-        : selectedRule?.rule === 'RECENT-POOL'
-        ? findNearestPrediction(0, 'RECENT-POOL')
-        : findNearestPrediction(0, selectedRule?.rule || 'EXACT-SIZE-COLOR');
-    const number = deepAnalysis?.number ?? selectedNumber ?? oppositePool[0];
-    const confidence = selectedRule?.tested ? Math.round(selectedRule.rate * 100) : 0;
+    // HTML colour model: same-number historical next-colour, secondary only.
+    let sameNumRed = 0, sameNumTotal = 0;
+    for (let i = 1; i < N; i++) {
+        if (rows[i].number !== lastNum) continue;
+        sameNumTotal++;
+        if (getColor(rows[i - 1].number) === 'RED') sameNumRed++;
+    }
+    const colorScore = sameNumTotal >= 8 ? 0.65 * pct(sameNumRed + 1, sameNumTotal + 2) + 0.35 * priorRed : priorRed;
+    const finalColor = colorScore >= 0.5 ? 'RED' : 'GREEN';
+    const colorConfidence = Math.round(Math.max(colorScore, 1 - colorScore) * 100);
+    const alternateNumber = finalSize === 'BIG' ? 4 : 5;
+    const nextPeriod = getNextIssue(String(latest.issueNumber ?? latest.issue ?? rows[0].issue));
+    const cacheKey = `${nextPeriod}:${lastNum}:${finalSize}:${N}`;
+    if (getCombinedSourcePrediction._cache?.key === cacheKey) return getCombinedSourcePrediction._cache.signal;
 
     const signal = {
         type: 'COMBINED',
-        val: size,
-        number,
-        mode: 'ALL HISTORY OPPOSITE SIZE+COLOUR+NUMBER ANALYSIS',
-        pat: 'MARKOV+MOMENTUM+REVERSAL',
-        pattern: `${ensemble ? ensemble.modelText : 'SOURCE-MAPPING-FALLBACK'} | SIZE-${size} | OPPOSITE-POOL`,
-        sizeConfidence: ensemble?.confidence ?? 50,
-        modelAgreement: ensemble?.agreement || 'fallback',
-        numberConfidence: deepAnalysis?.numberConfidence ?? confidence,
-        historicalRows: deepAnalysis?.sourceRows || fullHistory.length,
-        contextSamples: deepAnalysis?.contextSamples || 0,
-        walkForwardRate: deepAnalysis?.walkForwardRate || 0,
+        val: finalSize,
+        number: alternateNumber,
+        mode: 'BIG/SMALL + NUMBER',
+        pat: 'HTML-FULL-HISTORY-ADAPTIVE-RUN-AWARE',
+        pattern: `LAST-${bestLen || 3}-NUMBER-PATTERN | RUN-${lastSize}${runLen}`,
+        sizeConfidence,
+        colorConfidence,
+        numberConfidence: sizeConfidence,
+        historicalRows: N,
+        patternHits: bestHits,
+        usedLen: bestLen,
+        runLen,
+        colorRunLen,
+        colorRunTotal,
         decisionReason:
-            `Size ${size}; opposite number pool ${oppositePool.join(',')}; ` +
-            `models ${ensemble?.agreement || 'n/a'}; pool ${oppositePool.join(',')} | ` +
-            `Lucifer context ${currentSize || 'SIZE'}+${currentColor || 'COLOR'} | ` +
-            `rule ${selectedRule?.rule || 'FALLBACK'} walk-forward ${selectedRule?.hits || 0}/${selectedRule?.tested || 0} | ` +
-            `selected ${number} | ALL rows ${deepAnalysis?.sourceRows || fullHistory.length} | ` +
-            `context ${deepAnalysis?.contextSamples || 0} | walk-forward ${deepAnalysis?.walkForwardRate || 0}%`,
+            `HTML logic: full ${N} rows; last10=${rows.slice(0, 10).map(r => r.number).join('')}; ` +
+            `size ${Math.round(scoreBig * 100)}% BIG/${Math.round((1 - scoreBig) * 100)}% SMALL; ` +
+            `run=${lastSize}${runLen}; transition=${Math.round(transitionBig * 100)}% BIG; ` +
+            `pattern=${Math.round(patternBig * 100)}% BIG (${bestHits} hits, L${bestLen || '-'}); ` +
+            `colour=${finalColor} ${colorConfidence}%; alternate number=${alternateNumber}`,
         bets: [
-            { type: 'SIZE', val: size, kind: 'size' },
-            { type: 'NUMBER', val: number, kind: 'number' }
+            { type: 'SIZE', val: finalSize, kind: 'size' },
+            { type: 'NUMBER', val: alternateNumber, kind: 'number' }
         ]
     };
     getCombinedSourcePrediction._cache = { key: cacheKey, signal };
@@ -1553,9 +1563,11 @@ function luciferFeatureKey(row, index, rule) {
 // trends as supporting contexts. Every candidate is evaluated on historical
 // next-result outcomes before it is allowed to emit a signal.
 function analyzeLuciferNumberToSizeHistory(historyList, currentRow) {
-    // IMPORTANT: the prediction is based on NUMBERS only. Existing SIZE and
-    // COLOUR values are retained only for diagnostics; they never decide the
-    // output. Final mapping is always: 0-4 = SMALL, 5-9 = BIG.
+    // NUMBER-ONLY MODEL:
+    // 1) build several ranked lists of the best five digits from old history;
+    // 2) compare the lists using measured historical next-result accuracy;
+    // 3) map the selected five digits to SIZE only at the final step.
+    // SIZE and COLOUR fields are deliberately not used as prediction inputs.
     const history = (Array.isArray(historyList) ? historyList : [])
         .map(item => ({
             number: getResultNumber(item),
@@ -1568,137 +1580,161 @@ function analyzeLuciferNumberToSizeHistory(historyList, currentRow) {
 
     const currentNumber = getResultNumber(current);
     if (currentNumber === null) return null;
-
-    const numberStats = (depth, keyForRow = null) => {
-        const buckets = new Map();
-        for (let index = 1; index + depth - 1 < history.length; index++) {
-            const contextRows = history.slice(index, index + depth);
-            const key = contextRows.map(row => row.number).join(',');
-            if (!key) continue;
-            // Optional timing context is a secondary number-pattern validator.
-            const fullKey = keyForRow ? `${key}|${keyForRow(contextRows[0])}` : key;
-            const next = history[index - 1]?.number;
-            if (!Number.isInteger(next)) continue;
-            if (!buckets.has(fullKey)) buckets.set(fullKey, {
-                digits: Array(10).fill(0), samples: 0, recentSamples: 0
-            });
-            const bucket = buckets.get(fullKey);
-            bucket.digits[next]++;
-            bucket.samples++;
-            if (index < 101) bucket.recentSamples++;
-        }
-        return buckets;
-    };
-
-    const timingKey = row => {
-        // Use only period/timestamp timing as a secondary context, never SIZE.
-        if (row.timestamp > 0) return `T${Math.floor((row.timestamp / 60) % 60 / 5)}`;
-        const digits = String(row.issue || '').replace(/\D/g, '');
-        return digits ? `P${digits.slice(-2)}` : 'T0';
-    };
-
-    const stats1 = numberStats(1);
-    const stats3 = numberStats(3);
-    const stats1Timing = numberStats(1, timingKey);
-    const stats3Timing = numberStats(3, timingKey);
     const currentIssue = String(current.issueNumber ?? current.issue ?? current.period ?? '');
-    const currentTimeKey = timingKey({ timestamp: Number(current.timestamp) || 0, issue: currentIssue });
-    const contexts = [
-        { label: 'NUMBER-3', key: history.slice(0, 3).map(row => row.number).join(','), map: stats3, weight: 3.0 },
-        { label: 'NUMBER-1', key: String(currentNumber), map: stats1, weight: 2.0 },
-        { label: 'NUMBER-3+TIMING', key: `${history.slice(0, 3).map(row => row.number).join(',')}|${currentTimeKey}`, map: stats3Timing, weight: 1.25 },
-        { label: 'NUMBER-1+TIMING', key: `${currentNumber}|${currentTimeKey}`, map: stats1Timing, weight: 1.0 }
-    ];
+    const timeKey = row => {
+        if (Number(row?.timestamp) > 0) return Math.floor((Number(row.timestamp) / 60) % 60 / 5);
+        const digits = String(row?.issue || '').replace(/\D/g, '');
+        return digits ? Number(digits.slice(-2)) % 12 : 0;
+    };
+    const currentTime = timeKey({ timestamp: Number(current.timestamp) || 0, issue: currentIssue });
 
-    const candidates = [];
-    for (const context of contexts) {
-        const bucket = context.map.get(context.key);
-        if (!bucket || bucket.samples < 2) continue;
-        const ranked = bucket.digits
-            .map((count, digit) => ({ digit, count }))
-            .sort((a, b) => b.count - a.count || a.digit - b.digit);
-        const best = ranked[0];
-        const second = ranked[1] || { count: 0 };
-        const confidence = Math.round(best.count / bucket.samples * 100);
-        const edge = (best.count - second.count) / bucket.samples;
-        candidates.push({
-            label: context.label,
-            key: context.key,
-            digit: best.digit,
-            size: best.digit <= 4 ? 'SMALL' : 'BIG',
-            confidence,
-            edge,
-            samples: bucket.samples,
-            weight: context.weight,
-            digits: bucket.digits
-        });
+    const countFor = (indices, targetFn = row => row.number, weightFn = () => 1) => {
+        const counts = Array(10).fill(0);
+        for (const index of indices) {
+            const digit = targetFn(history[index]);
+            const weight = Number(weightFn(index)) || 0;
+            if (Number.isInteger(digit) && digit >= 0 && digit <= 9) counts[digit] += weight;
+        }
+        return counts;
+    };
+    const rankFive = (counts, label) => {
+        const ranked = counts.map((score, digit) => ({ digit, score }))
+            .sort((a, b) => b.score - a.score || a.digit - b.digit);
+        return { label, counts, numbers: ranked.slice(0, 5).map(item => item.digit) };
+    };
+
+    // Model A: complete-history number frequency.
+    const allIndices = Array.from({ length: history.length }, (_, i) => i);
+    const frequencyModel = rankFive(countFor(allIndices), 'ALL-NUMBER-FREQUENCY');
+
+    // Model B: numbers that historically followed the current latest number.
+    const transitionIndices = [];
+    for (let index = 1; index < history.length; index++) {
+        if (history[index].number === currentNumber) transitionIndices.push(index - 1);
     }
+    const transitionModel = rankFive(countFor(transitionIndices), 'AFTER-NUMBER-' + currentNumber);
 
-    // Recent number trend is a tie-breaker and confidence stabilizer; it does
-    // not inspect SIZE or COLOUR and cannot change a strong 3-number result.
-    const recent = history.slice(0, Math.min(30, history.length));
-    const recentDigits = Array(10).fill(0);
-    recent.forEach(row => recentDigits[row.number]++);
-    const recentBest = recentDigits
-        .map((count, digit) => ({ count, digit }))
-        .sort((a, b) => b.count - a.count || a.digit - b.digit)[0];
-
-    if (candidates.length) {
-        candidates.sort((a, b) =>
-            b.confidence - a.confidence || b.edge - a.edge ||
-            (b.label === 'NUMBER-3' ? 1 : 0) - (a.label === 'NUMBER-3' ? 1 : 0) ||
-            b.samples - a.samples
-        );
+    // Model C: the latest three-number context, e.g. 1,3,2.
+    const latestThree = history.slice(0, 3).map(row => row.number).join(',');
+    const tripleIndices = [];
+    for (let index = 1; index + 2 < history.length; index++) {
+        const key = history.slice(index, index + 3).map(row => row.number).join(',');
+        if (key === latestThree) tripleIndices.push(index - 1);
     }
+    const tripleModel = rankFive(countFor(tripleIndices), 'THREE-NUMBER-' + latestThree);
 
-    // Always produce a bet signal. If no context has enough samples, use the
-    // measured full-history number frequency rather than returning SKIP.
-    const selected = candidates[0] || (() => {
-        const allDigits = Array(10).fill(0);
-        history.forEach(row => allDigits[row.number]++);
-        const ranked = allDigits.map((count, digit) => ({ count, digit }))
-            .sort((a, b) => b.count - a.count || a.digit - b.digit);
-        const best = ranked[0];
-        return {
-            label: 'FULL-NUMBER-FREQUENCY', key: 'ALL', digit: best.digit,
-            size: best.digit <= 4 ? 'SMALL' : 'BIG',
-            confidence: Math.round(best.count / history.length * 100), edge: 0,
-            samples: history.length, weight: 0, digits: allDigits
-        };
-    })();
+    // Model D: same timing bucket + latest number, used only as a secondary
+    // number-pattern model when enough historical samples exist.
+    const timingIndices = [];
+    for (let index = 1; index < history.length; index++) {
+        if (history[index].number === currentNumber && timeKey(history[index]) === currentTime) timingIndices.push(index - 1);
+    }
+    const timingModel = rankFive(countFor(timingIndices), 'NUMBER-' + currentNumber + '-TIME-' + currentTime);
 
-    const sameSide = candidates.filter(item => item.size === selected.size).length;
-    const wrongSide = candidates.length - sameSide;
-    const patternStatus = wrongSide ? `wrong-patterns=${wrongSide}` : 'patterns-aligned';
-    const timingStatus = candidates.some(item => item.label.includes('TIMING'))
-        ? `timing=${currentTimeKey}` : 'timing=insufficient-data';
-    const numberSequence = history.slice(0, 3).map(row => row.number).join('-');
-    const recentTrend = recent.map(row => row.number).join('');
+    // Model E: recency-weighted trend across EVERY history row. This is not a
+    // 100-row slice: old rows still contribute with a small weight, so the
+    // complete API history participates in the ranking.
+    const recencyModel = rankFive(
+        countFor(allIndices, row => row.number, index => Math.exp(-index / 5000)),
+        'ALL-NUMBER-RECENCY-WEIGHTED'
+    );
+
+    const models = [frequencyModel, transitionModel, tripleModel, timingModel, recencyModel];
+    const sizeOf = digit => digit <= 4 ? 'SMALL' : 'BIG';
+
+    // Backtest a model's final SIZE choice against the same type of historical
+    // context. This is a measured score, not a guarantee.
+    const validateModel = model => {
+        const small = model.numbers.filter(digit => sizeOf(digit) === 'SMALL').length;
+        const big = model.numbers.length - small;
+        const predictedSize = small >= big ? 'SMALL' : 'BIG';
+        let wins = 0;
+        let samples = 0;
+        if (model.label.startsWith('THREE-NUMBER-')) {
+            for (let index = 1; index + 2 < history.length; index++) {
+                if (history.slice(index, index + 3).map(row => row.number).join(',') !== latestThree) continue;
+                samples++;
+                if (sizeOf(history[index - 1].number) === predictedSize) wins++;
+            }
+        } else if (model.label.startsWith('AFTER-NUMBER-')) {
+            for (let index = 1; index < history.length; index++) {
+                if (history[index].number !== currentNumber) continue;
+                samples++;
+                if (sizeOf(history[index - 1].number) === predictedSize) wins++;
+            }
+        } else if (model.label.startsWith('NUMBER-') && model.label.includes('-TIME-')) {
+            for (let index = 1; index < history.length; index++) {
+                if (history[index].number !== currentNumber || timeKey(history[index]) !== currentTime) continue;
+                samples++;
+                if (sizeOf(history[index - 1].number) === predictedSize) wins++;
+            }
+        } else {
+            // Validate against the complete history for both full-frequency and
+            // recency-weighted models; no recent-window cap is used.
+            const limit = history.length - 1;
+            for (let index = 1; index <= limit; index++) {
+                samples++;
+                if (sizeOf(history[index - 1].number) === predictedSize) wins++;
+            }
+        }
+        const confidence = samples ? Math.round(wins / samples * 100) : 0;
+        return { ...model, predictedSize, small, big, wins, samples, confidence };
+    };
+
+    const evaluated = models.map(validateModel);
+    // Prefer a model with high measured confidence and enough evidence. If
+    // multiple models return the same SIZE, aggregate their agreement. If no
+    // model has evidence, still use the all-history best-five fallback.
+    const evidence = evaluated.filter(model => model.samples >= 2);
+    evidence.sort((a, b) =>
+        b.confidence - a.confidence || b.samples - a.samples ||
+        (b.label.startsWith('THREE-NUMBER-') ? 1 : 0) - (a.label.startsWith('THREE-NUMBER-') ? 1 : 0)
+    );
+    const selected = evidence[0] || validateModel(frequencyModel);
+    const samePrediction = evaluated.filter(model => model.predictedSize === selected.predictedSize).length;
+    const oppositePrediction = evaluated.length - samePrediction;
+
+    // If equal/contradictory candidates exist, select the one with the highest
+    // measured confidence (already done above), then prefer the 3-number model.
+    const bestFive = selected.numbers;
+    const smallCount = bestFive.filter(digit => sizeOf(digit) === 'SMALL').length;
+    const bigCount = bestFive.length - smallCount;
+    const finalSize = smallCount >= bigCount ? 'SMALL' : 'BIG';
+    const majorityConfidence = Math.round(Math.max(smallCount, bigCount) / bestFive.length * 100);
+    const measuredConfidence = selected.confidence || majorityConfidence;
+    const actualConfidence = Math.max(measuredConfidence, majorityConfidence);
+    const recentNumbers = history.slice(0, 20).map(row => row.number).join('');
 
     return {
         type: 'SIZE',
-        val: selected.size,
+        val: finalSize,
         mode: 'BIG/SMALL',
-        pat: 'LUCIFER-NUMBER-ONLY-1OR3',
+        pat: 'LUCIFER-BEST-5-NUMBER-ANALYSIS',
         pattern: selected.label,
-        conf: Math.max(1, Math.min(99, selected.confidence)),
+        conf: Math.max(1, Math.min(99, actualConfidence)),
         historyBased: true,
         externalPatternSignal: true,
-        number: selected.digit,
-        analyzedNumber: selected.digit,
-        analysisNumbers: selected.label.includes('3') ? 3 : 1,
+        number: bestFive[0],
+        bestFiveNumbers: bestFive,
+        smallNumbers: bestFive.filter(digit => sizeOf(digit) === 'SMALL'),
+        bigNumbers: bestFive.filter(digit => sizeOf(digit) === 'BIG'),
+        smallCount,
+        bigCount,
+        analyzedNumber: bestFive[0],
+        analysisNumbers: 5,
         historicalSamples: selected.samples,
+        totalHistoryRows: history.length,
+        measuredAccuracy: measuredConfidence,
+        modelAgreement: `${samePrediction}/${evaluated.length}`,
         numberContext: currentNumber,
-        numberSequence,
-        recentNumberTrend: recentTrend,
-        recentMostFrequentNumber: recentBest?.digit,
-        supportingRules: candidates.length,
+        numberSequence: latestThree,
+        recentNumberTrend: recentNumbers,
         decisionReason:
-            `NUMBER ONLY: ${selected.label} [${selected.key}] -> number ${selected.digit} ` +
-            `(${selected.size}), confidence ${selected.confidence}% from ${selected.samples} samples; ` +
-            `1/3-number rules agree ${sameSide}/${candidates.length || 1}; ${patternStatus}; ` +
-            `${timingStatus}; recent numbers ${recentTrend}`,
-        bets: [{ type: 'SIZE', val: selected.size, kind: 'size' }]
+            `BEST 5 NUMBERS: [${bestFive.join(',')}] | SMALL=${smallCount}, BIG=${bigCount} -> ${finalSize}; ` +
+            `selected ${selected.label}; measured ${measuredConfidence}% (${selected.wins}/${selected.samples || 0}); ` +
+            `majority ${majorityConfidence}%; models agree ${samePrediction}/${evaluated.length}; ` +
+            `ALL HISTORY rows=${history.length}; recent numbers ${recentNumbers}; timing bucket ${currentTime}`,
+        bets: [{ type: 'SIZE', val: finalSize, kind: 'size' }]
     };
 }
 
@@ -1827,7 +1863,7 @@ function generateRandomBigSmallFallback(period) {
 
 async function fetchListForUser(userId) {
     const mode = String(autobetCfg[userId]?.mode || '').toUpperCase();
-    if (mode === 'COMBINED') return await fetchCombinedSourceList();
+    if (mode === 'COMBINED') return await fetchLuciferOldHistoryForAnalysis();
     // BIG/SMALL mode follows the uploaded 3.html source exactly.
     return await fetchWhimsicalHistory();
 }
@@ -1883,8 +1919,13 @@ async function getLiveBalance(userId, chatId = null) {
         const r = await axios.get(url, { headers, timeout: 10000 });
         const parsed = await parseBalanceResponse(r);
         if (parsed.success) {
-            if (!profitTrack[userId]) profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0 };
-            profitTrack[userId].walletBalance = Number(parsed.balance) || 0;
+            if (!profitTrack[userId]) profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0, lossStreakHits: 0 };
+            const liveBalance = Number(parsed.balance) || 0;
+            const balanceTrack = profitTrack[userId];
+            if (!Number.isFinite(Number(balanceTrack.startBalance))) balanceTrack.startBalance = liveBalance;
+            balanceTrack.walletBalance = liveBalance;
+            balanceTrack.liveBalance = liveBalance;
+            balanceTrack.liveNet = liveBalance - Number(balanceTrack.startBalance || 0);
         }
         return parsed;
     } catch (e) {
@@ -1897,9 +1938,14 @@ async function getLiveBalance(userId, chatId = null) {
         const fallbackAge = fallback ? Date.now() - fallback.capturedAt : Infinity;
         if (e.response?.status === 403 && Number.isFinite(fallback?.balance) && fallbackAge < 10 * 60 * 1000) {
             console.warn(`[BALANCE FALLBACK] Using wallet page value for user ${userId}; age=${Math.round(fallbackAge / 1000)}s`);
-            if (!profitTrack[userId]) profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0 };
-            profitTrack[userId].walletBalance = fallback.balance;
-            return { success: true, balance: fallback.balance, source: "wallet-page" };
+            if (!profitTrack[userId]) profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0, lossStreakHits: 0 };
+            const liveBalance = Number(fallback.balance) || 0;
+            const balanceTrack = profitTrack[userId];
+            if (!Number.isFinite(Number(balanceTrack.startBalance))) balanceTrack.startBalance = liveBalance;
+            balanceTrack.walletBalance = liveBalance;
+            balanceTrack.liveBalance = liveBalance;
+            balanceTrack.liveNet = liveBalance - Number(balanceTrack.startBalance || 0);
+            return { success: true, balance: liveBalance, source: "wallet-page" };
         }
         return { success: false, message: errMsg };
     }
@@ -1915,7 +1961,8 @@ function initUser(id) {
     if (!sentPeriods[id])  sentPeriods[id]  = new Set();
     if (!autobetCfg[id])   autobetCfg[id]   = { 
         watch:false, 
-        watchLoss:2, 
+        watchLoss:2,
+        watchWins:2, 
         baseBet:1, 
         maxLvl:5, 
         enabled:false,
@@ -1956,6 +2003,8 @@ function initUser(id) {
         watchWinStreak: 0,
         lastOutcome: null
     };
+    if (!Number.isInteger(autobetCfg[id].watchWins)) autobetCfg[id].watchWins = 2;
+    if (!autobetState[id].watchWinStreak) autobetState[id].watchWinStreak = 0;
     if (!autobetState[id].levelHistory || typeof autobetState[id].levelHistory !== "object") autobetState[id].levelHistory = {};
     if (!Number.isInteger(autobetState[id].sizeLevel) || autobetState[id].sizeLevel < 1) autobetState[id].sizeLevel = autobetState[id].level || 1;
     if (!Number.isInteger(autobetState[id].numberLevel) || autobetState[id].numberLevel < 1) autobetState[id].numberLevel = autobetState[id].level || 1;
@@ -2316,7 +2365,7 @@ async function placeBet(userId, chatId, period, prediction, predType, level, amo
                 betMultiple: betMult,
                 // COLOR formula and NUMBER use the user's 30-second game;
                 // the legacy SIZE/COMBINED routes remain on WinGo_1M.
-                gameCode:    (cfg.mode === "COMBINED" ? "WinGo_1M" : "WinGo_30S"),
+                gameCode:    "WinGo_30S",
                 issueNumber: String(period),
                 language:    "en",
                 random:      Math.floor(Math.random() * 1e12)
@@ -3618,12 +3667,12 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
     if (!betPlaced && st && st.waitingForWatchWin) {
         if (wasWin) {
             st.watchWinStreak = Number(st.watchWinStreak || 0) + 1;
-            if (st.watchWinStreak >= REQUIRED_WATCH_WINS) {
+            if (st.watchWinStreak >= getRequiredWatchWins(userId)) {
                 st.waitingForWatchWin = false;
                 st.watchWinStreak = 0;
                 st.lastOutcome = 'WATCH_2_WINS_UNLOCK_NEXT_PERIOD';
             } else {
-                st.lastOutcome = `WATCH_WIN_${st.watchWinStreak}_OF_${REQUIRED_WATCH_WINS}`;
+                st.lastOutcome = `WATCH_WIN_${st.watchWinStreak}_OF_${getRequiredWatchWins(userId)}`;
             }
         } else {
             st.watchWinStreak = 0;
@@ -3786,7 +3835,15 @@ async function sendResultAmountLine(chatId, userId, label, amount) {
         ? "₹" + Math.floor(Number(balance.balance) || 0)
         : "Unavailable";
     const sign = label === "Profit" ? "+" : "-";
-    await send(chatId, label + ": " + sign + "₹" + Math.floor(Math.abs(Number(amount) || 0)) + " | P&L: " + (pnl >= 0 ? "+" : "-") + "₹" + Math.floor(Math.abs(pnl)) + " | Balance: " + balanceText);
+    const liveNet = Number(profitTrack[userId]?.liveNet || 0);
+    const totalWin = Number(profitTrack[userId]?.totalWinProfit || 0);
+    const totalLoss = Number(profitTrack[userId]?.totalLossAmount || 0);
+    await send(chatId, label + ": " + sign + "₹" + Math.floor(Math.abs(Number(amount) || 0)) +
+        " | Period: " + (label === "Profit" ? "+" : "-") + "₹" + Math.floor(Math.abs(Number(amount) || 0)) +
+        " | Live Balance: " + balanceText +
+        " | Live Net: " + (liveNet >= 0 ? "+" : "-") + "₹" + Math.floor(Math.abs(liveNet)) +
+        " | Total Profit: " + (pnl >= 0 ? "+" : "-") + "₹" + Math.floor(Math.abs(pnl)) +
+        " | Winnings: +₹" + Math.floor(totalWin) + " | Loss Total: -₹" + Math.floor(totalLoss));
 }
 
 // ============================================================
@@ -3798,7 +3855,9 @@ async function handleWin(userId, chatId, actual, num, betLevel, bets = [], settl
     let profit;
     profit = settlement ? Number(settlement.pnl) || 0 : amt * (autobetCfg[userId].mode === "NUMBER" ? NUMBER_WIN_MULTIPLIER - 1 : SIZE_WIN_MULTIPLIER - 1);
     
-    pt.totalBets++; pt.wins++; pt.pnl += profit; 
+    pt.totalBets++; pt.wins++; pt.pnl += profit;
+    pt.totalWinProfit = (Number(pt.totalWinProfit) || 0) + profit;
+    pt.lastPeriodProfit = profit;
     pt.totalBetAmount = (pt.totalBetAmount || 0) + amt;
     pt.winStreak++; pt.lossStreak = 0;
     if(pt.winStreak > pt.maxW) pt.maxW = pt.winStreak;
@@ -3835,7 +3894,10 @@ async function handleLoss(userId, chatId, actual, num, betLevel, bets = [], sett
     const pt = profitTrack[userId];
     const amt = bets.length ? bets.reduce((sum, b) => sum + Number(b.amt || 0), 0) : getSequenceAmount(userId, betLevel);
     
-    pt.totalBets++; pt.losses++; pt.pnl += settlement ? settlement.pnl : -amt; 
+    const periodLoss = settlement ? Number(settlement.pnl) || 0 : -amt;
+    pt.totalBets++; pt.losses++; pt.pnl += periodLoss;
+    pt.totalLossAmount = (Number(pt.totalLossAmount) || 0) + Math.abs(periodLoss);
+    pt.lastPeriodProfit = periodLoss;
     pt.totalBetAmount = (pt.totalBetAmount || 0) + amt;
     pt.lossStreak++; pt.winStreak = 0;
     if(pt.lossStreak > pt.maxL) pt.maxL = pt.lossStreak;
@@ -4011,7 +4073,7 @@ async function runPredict(userId, chatId) {
         // A watch WIN unlocks the next period; watch losses keep the pause.
         if (st.waitingForWatchWin) {
             canBet = false;
-            abLine = "👀 WATCH MODE: " + Number(st.watchWinStreak || 0) + "/" + REQUIRED_WATCH_WINS + " wins → next bet L" + st.level;
+            abLine = "👀 WATCH MODE: " + Number(st.watchWinStreak || 0) + "/" + getRequiredWatchWins(userId) + " wins → next bet L" + st.level;
         } else {
             canBet = true;
             const sequence = cfg.mode === "NUMBER" ? cfg.customNumberBets : cfg.customBets;
@@ -4035,10 +4097,12 @@ async function runPredict(userId, chatId) {
 "║ Mode    : "+String(signal.mode || signal.pat || "PATTERN-5/4")+"\n"+
 "║ Pattern : "+String(signal.pattern || "LAST-5/LAST-4")+"\n"+
 "║ Number  : "+String(signal.number ?? "-")+"\n"+
-"║ Conf.   : "+String(signal.conf ?? signal.numberConfidence ?? "-")+"% | Hist "+String(signal.historicalWinRate ?? "-")+"%\n"+
+"║ Best 5  : "+String(signal.bestFiveNumbers?.join(",") ?? "-")+"\n"+
+"║ Count   : S"+String(signal.smallCount ?? "-")+" / B"+String(signal.bigCount ?? "-")+"\n"+
+"║ Conf.   : "+String(signal.conf ?? signal.numberConfidence ?? "-")+"% | Measured "+String(signal.measuredAccuracy ?? "-")+"%\n"+
 "║ "+(signal.type === "COLOR" ? "Color   : " : "Size    : ")+signal.val+"\n"+
 "║ Result  : "+formatPrediction(signal)+"\n"+
-"║ Source  : LAST 2 RESULTS COMPARISON\n"+
+"║ Source  : LUCIFER BEST-5 NUMBER ANALYSIS\n"+
 "╠══════════════════════════╣\n"+
 "║ "+abLine+"\n"+
 waitLine+"\n"+
@@ -4369,6 +4433,10 @@ function showStats(chatId,userId){
 "Loss streak : "+(d.lossStreak||0)+" | Worst: "+(d.maxLossStreak||0)+"\n"+
 "Streak hits : "+(pt.lossStreakHits||0)+" (threshold L"+(autobetCfg[userId].watchLoss||1)+")\n"+
 "P&L         : "+(pt.pnl>=0?"+":"")+Number(pt.pnl||0).toFixed(2)+"\n"+
+"Winnings    : +₹"+Number(pt.totalWinProfit||0).toFixed(2)+"\n"+
+"Loss Total  : -₹"+Number(pt.totalLossAmount||0).toFixed(2)+"\n"+
+"Start Bal   : ₹"+Number(pt.startBalance||0).toFixed(2)+" | Live Bal: ₹"+Number(pt.liveBalance||0).toFixed(2)+"\n"+
+"Live Net    : "+(Number(pt.liveNet||0)>=0?"+":"-")+"₹"+Math.abs(Number(pt.liveNet||0)).toFixed(2)+"\n"+
 "Staked      : ₹"+Number(pt.totalBetAmount||0).toFixed(2)+"\n\n"+
 "Level wins  : "+levelMapText(d.levelWins)+"\n"+
 "Level usage : "+levelMapText(st.levelHistory)+"\n"+
@@ -4392,6 +4460,8 @@ async function profitReport(chatId,userId){
 "Balance: "+balance+"\n"+
 "Bets   : "+pt.totalBets+"\nWins   : "+pt.wins+"\nLoss   : "+pt.losses+"\nRate   : "+rate+"%\n"+
 "P&L    : "+(pt.pnl>=0?"+":"")+pt.pnl.toFixed(2)+"\n"+
+"Winnings: +₹"+Number(pt.totalWinProfit||0).toFixed(2)+" | Loss Total: -₹"+Number(pt.totalLossAmount||0).toFixed(2)+"\n"+
+"Start Bal: ₹"+Number(pt.startBalance||0).toFixed(2)+" | Live Bal: ₹"+Number(pt.liveBalance||0).toFixed(2)+" | Live Net: "+(Number(pt.liveNet||0)>=0?"+":"-")+"₹"+Math.abs(Number(pt.liveNet||0)).toFixed(2)+"\n"+
 "Streak : "+pt.winStreak+"W / "+pt.lossStreak+"L\n"+
 "Streak hits: "+(pt.lossStreakHits||0)+" (threshold L"+(cfg.watchLoss||1)+")\n"+
 "Best W : "+Number(pt.maxW||0)+" | Max loss streak: "+Number(pt.maxL||0)+"\n"+
@@ -4437,8 +4507,8 @@ async function autobetStatus(chatId, userId) {
 "Mode     : "+modeLabel(cfg.mode)+"\n"+
     (cfg.mode === "COMBINED" ? "Size Bets: ₹"+cfg.customSizeBets.join(" → ₹")+"\nNum Bets : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule     : 1 site size + 1 site number\n" : "Bet Seq  : ₹"+cfg.customBets.join(" → ₹")+"\n")+
 "Watch    : "+(cfg.watch?"ON":"OFF")+"\n"+
-"WatchLoss: "+st.consecutiveLoss+"/"+cfg.watchLoss+"\n"+
-"Bet Flow : "+(st.waitingForWatchWin ? "WATCH "+(st.watchWinStreak||0)+"/"+REQUIRED_WATCH_WINS+" wins — then bet L"+st.level : "BET NEXT PERIOD")+"\n"+
+"WatchLoss: "+st.consecutiveLoss+"/"+cfg.watchLoss+"\n"+"WatchWins: "+getRequiredWatchWins(userId)+" consecutive\n"+
+"Bet Flow : "+(st.waitingForWatchWin ? "WATCH "+(st.watchWinStreak||0)+"/"+getRequiredWatchWins(userId)+" wins — then bet L"+st.level : "BET NEXT PERIOD")+"\n"+
 "Base Bet : ₹"+cfg.baseBet+"\n"+
 "Max Level: "+cfg.maxLvl+"\n"+
 "Target Profit: ₹"+cfg.targetProfit+"\n"+
@@ -4475,6 +4545,7 @@ const autobetMenu={keyboard:[
     ["🧠 Set Plan Level","🎯 Set Profit Target"],
     ["💹 Set Profit Switch"],
     ["⏳ Set Section Delay","🔢 Set Watch Losses"],
+    ["🏆 Set Watch Wins"],
     ["📊 AutoBet Status","🔀 Customize Bet"],
     ["🎮 Mode: Big/Small","🎨 Mode: Color"],
     ["🔢 Mode: Number"],
@@ -4846,6 +4917,13 @@ function addHandlers(){
                 delete userAction[id];
                 return send(id, "✅ Watch Loss Updated: " + v + "\n(Bot will wait for " + v + " losses before betting)", {reply_markup: autobetMenu});
             }
+            else if(s.action === "setwwins"){
+                const v = parseInt(text);
+                if(isNaN(v) || v < 1 || v > 20) return send(id, "❌ Enter watch wins from 1 to 20.");
+                autobetCfg[id].watchWins = v;
+                delete userAction[id];
+                return send(id, "✅ Watch Wins Updated: " + v + "\n(After a live loss, " + v + " consecutive watch wins unlock the next bet)", {reply_markup: autobetMenu});
+            }
             else if(s.action === "setcustom"){
                 const vals = text.split(/[, ]+/).map(v => parseInt(v.trim())).filter(v => !isNaN(v) && v > 0);
                 if(vals.length === 0) return send(id, "❌ Invalid Format! Use: 1,4,7,9");
@@ -4882,7 +4960,7 @@ function addHandlers(){
 "Mode     : "+modeLabel(cfg.mode)+"\n"+
     (cfg.mode === "COMBINED" ? "Size Seq : ₹"+cfg.customSizeBets.join(" → ₹")+"\nNum Seq  : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule     : 1 site size + 1 site number\n" : "Bet Seq  : ₹"+cfg.customBets.join(" → ₹")+"\n")+
 "Watch    : "+(cfg.watch?"ON":"OFF")+"\n"+
-"WatchLoss: "+cfg.watchLoss+" consecutive\n"+
+"WatchLoss: "+cfg.watchLoss+" consecutive\n"+"WatchWins: "+getRequiredWatchWins(id)+" consecutive\n"+
 "Base Bet : ₹"+cfg.baseBet+"\n"+
 "Max Level: "+cfg.maxLvl+"\n"+
 "Target   : ₹"+targetProfit+"\n\n"+
@@ -4904,6 +4982,7 @@ formatMartingale(cfg)+"\n\n"+
         if(text==="❌ Disable AutoBet"){autobetCfg[id].enabled=false;return send(id,"❌ AutoBet OFF",{reply_markup:userMenu(id)});}
         if(text==="👀 Watch Mode ON") {autobetCfg[id].watch=true;return send(id,"👀 Watch ON — "+autobetCfg[id].watchLoss+" losses → bet");}
         if(text==="👀 Watch Mode OFF"){autobetCfg[id].watch=false;return send(id,"👀 Watch OFF — Direct bet!");}
+        if(text==="🏆 Set Watch Wins"){userAction[id]={action:"setwwins"};return send(id,"Enter consecutive watch wins required (1-20). Example: 3");}
         if(text==="📈 Profit Plan ON") {
             userAction[id] = {action: "setprofitplaninput"};
             return send(id, "Enter max level:\nExample: 5\n\nThe actual wallet balance will be fetched automatically. Max level must be 1-10.");
@@ -5090,6 +5169,10 @@ if(text==="🔢 Set Watch Losses"){
             predictionDispatches.set(String(id), new Set());
             settledPeriods.delete(String(id));
             autobetState[id]={...(autobetState[id]||{}),level:1,sizeLevel:1,numberLevel:1,consecutiveLoss:0,inMart:false,lastWinLevel:null,lastWinMode:null,waitingForWatchWin:false,watchWinStreak:0,lastOutcome:null};
+            if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].liveNet = 0; profitTrack[id].lastPeriodProfit = 0; }
+            // Capture the real wallet before the first bet, so live-net P&L
+            // starts from the actual balance (for example ₹500.00).
+            await getLiveBalance(id);
 
             // Load previous B/S history from API
             const prevList = await fetchList();
