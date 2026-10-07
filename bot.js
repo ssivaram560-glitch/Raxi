@@ -1922,10 +1922,14 @@ async function getLiveBalance(userId, chatId = null) {
             if (!profitTrack[userId]) profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0, lossStreakHits: 0 };
             const liveBalance = Number(parsed.balance) || 0;
             const balanceTrack = profitTrack[userId];
-            if (!Number.isFinite(Number(balanceTrack.startBalance))) balanceTrack.startBalance = liveBalance;
+            const hasStartBalance = balanceTrack.startBalance !== null &&
+                balanceTrack.startBalance !== undefined &&
+                balanceTrack.startBalance !== "" &&
+                Number.isFinite(Number(balanceTrack.startBalance));
+            if (!hasStartBalance) balanceTrack.startBalance = liveBalance;
             balanceTrack.walletBalance = liveBalance;
             balanceTrack.liveBalance = liveBalance;
-            balanceTrack.liveNet = liveBalance - Number(balanceTrack.startBalance || 0);
+            balanceTrack.liveNet = liveBalance - Number(balanceTrack.startBalance);
         }
         return parsed;
     } catch (e) {
@@ -1941,10 +1945,14 @@ async function getLiveBalance(userId, chatId = null) {
             if (!profitTrack[userId]) profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0, lossStreakHits: 0 };
             const liveBalance = Number(fallback.balance) || 0;
             const balanceTrack = profitTrack[userId];
-            if (!Number.isFinite(Number(balanceTrack.startBalance))) balanceTrack.startBalance = liveBalance;
+            const hasStartBalance = balanceTrack.startBalance !== null &&
+                balanceTrack.startBalance !== undefined &&
+                balanceTrack.startBalance !== "" &&
+                Number.isFinite(Number(balanceTrack.startBalance));
+            if (!hasStartBalance) balanceTrack.startBalance = liveBalance;
             balanceTrack.walletBalance = liveBalance;
             balanceTrack.liveBalance = liveBalance;
-            balanceTrack.liveNet = liveBalance - Number(balanceTrack.startBalance || 0);
+            balanceTrack.liveNet = liveBalance - Number(balanceTrack.startBalance);
             return { success: true, balance: liveBalance, source: "wallet-page" };
         }
         return { success: false, message: errMsg };
@@ -2010,16 +2018,7 @@ function initUser(id) {
     if (!Number.isInteger(autobetState[id].numberLevel) || autobetState[id].numberLevel < 1) autobetState[id].numberLevel = autobetState[id].level || 1;
     if (!autobetState[id].sizeLevelHistory || typeof autobetState[id].sizeLevelHistory !== "object") autobetState[id].sizeLevelHistory = {};
     if (!autobetState[id].numberLevelHistory || typeof autobetState[id].numberLevelHistory !== "object") autobetState[id].numberLevelHistory = {};
-    if (!profitTrack[id])  profitTrack[id]  = {
-        totalBets: 0, wins: 0, losses: 0, pnl: 0, winStreak: 0, lossStreak: 0,
-        maxW: 0, maxL: 0, totalBetAmount: 0, totalWinnings: 0, totalLossAmount: 0,
-        totalProfit: 0, lossStreakHits: 0, liveWinnings: 0, liveLossAmount: 0
-    };
-    // Accounting fields: investment is every confirmed stake; winnings is gross
-    // payout (stake included); profit is gross winnings minus total investment.
-    for (const field of ['totalBetAmount', 'totalWinnings', 'totalLossAmount', 'totalProfit', 'liveWinnings', 'liveLossAmount']) {
-        if (!Number.isFinite(Number(profitTrack[id][field]))) profitTrack[id][field] = 0;
-    }
+    if (!profitTrack[id])  profitTrack[id]  = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0, lossStreakHits: 0 };
     if (!Number.isFinite(Number(profitTrack[id].maxW)) || profitTrack[id].maxW < 0) profitTrack[id].maxW = 0;
     if (!Number.isFinite(Number(profitTrack[id].maxL)) || profitTrack[id].maxL < 0) profitTrack[id].maxL = 0;
     if (!Number.isFinite(Number(profitTrack[id].winStreak)) || profitTrack[id].winStreak < 0) profitTrack[id].winStreak = 0;
@@ -3839,59 +3838,75 @@ function getStatus(userId) {
 
 async function sendResultAmountLine(chatId, userId, label, amount, settlement = null) {
     const balance = await getLiveBalance(userId);
-    const pt = profitTrack[userId] || {};
+    const pt = profitTrack[userId] || (profitTrack[userId] = {});
+    const currentLiveBalance = balance.success
+        ? Number(balance.balance) || 0
+        : Number(pt.liveBalance || 0);
     const snapshot = pt.activeBetSnapshot || {};
+    const settlementStake = settlement && Number.isFinite(Number(settlement.totalStake))
+        ? Number(settlement.totalStake)
+        : null;
+    const investment = settlementStake !== null
+        ? settlementStake
+        : Number(snapshot.investment || amount || 0);
+    const hasBeforeBalance = snapshot.beforeBalance !== null &&
+        snapshot.beforeBalance !== undefined &&
+        snapshot.beforeBalance !== "" &&
+        Number.isFinite(Number(snapshot.beforeBalance));
+    const beforeBalance = hasBeforeBalance
+        ? Number(snapshot.beforeBalance)
+        : currentLiveBalance;
+    const netDelta = currentLiveBalance - beforeBalance;
 
-    // Investment always means the total amount actually placed for this period.
-    const investment = Math.max(0, Number(
-        settlement?.totalStake ?? snapshot.investment ?? amount ?? 0
-    ));
-    // calculateSettlement.payout is the gross return and includes the original
-    // stake. A loss has no payout; its full stake is recorded as loss.
+    // Use the deterministic settlement ledger whenever available. Wallet API
+    // reads are only a display fallback and must never overwrite cumulative P&L.
     const grossWinnings = label === 'Profit'
-        ? Math.max(0, Number(settlement?.payout ?? pt.lastPeriodGrossWinnings ?? (investment + Number(amount || 0))))
+        ? (settlement ? Math.max(0, Number(settlement.payout) || 0) : Math.max(0, netDelta + investment))
         : 0;
     const lossAmount = label === 'Loss'
-        ? Math.max(0, Number(settlement?.totalStake ?? pt.lastPeriodLossAmount ?? investment))
+        ? (settlement ? Math.max(0, Math.abs(Number(settlement.pnl) || 0)) : Math.max(0, investment - Math.max(0, netDelta)))
         : 0;
-    const periodProfit = grossWinnings - investment;
+    const netProfit = label === 'Profit'
+        ? (settlement ? Number(settlement.pnl) || 0 : grossWinnings - investment)
+        : -lossAmount;
 
     if (balance.success) {
-        pt.lastSettledBalance = Number(balance.balance) || 0;
-        pt.liveBalance = Number(balance.balance) || 0;
+        pt.lastSettledBalance = currentLiveBalance;
+        pt.liveBalance = currentLiveBalance;
+        const hasStartBalance = pt.startBalance !== null &&
+            pt.startBalance !== undefined &&
+            pt.startBalance !== "" &&
+            Number.isFinite(Number(pt.startBalance));
+        if (!hasStartBalance) pt.startBalance = currentLiveBalance;
+        pt.liveNet = currentLiveBalance - Number(pt.startBalance);
     }
+    // The authoritative cumulative value is the result ledger updated by
+    // handleWin/handleLoss, not liveNet (which can be affected by API timing).
+    pt.pnl = (Number(pt.totalWinProfit) || 0) - (Number(pt.totalLossAmount) || 0);
+    pt.lastPeriodLiveDelta = netProfit;
     pt.lastInvestment = investment;
     pt.lastGrossWinnings = grossWinnings;
     pt.lastLossAmount = lossAmount;
-    pt.lastPeriodLiveDelta = periodProfit;
-    pt.lastPeriodProfit = periodProfit;
+    if (label === 'Profit') pt.liveWinnings = (Number(pt.liveWinnings) || 0) + grossWinnings;
+    if (label === 'Loss') pt.liveLossAmount = (Number(pt.liveLossAmount) || 0) + lossAmount;
 
-    const totalInvestment = Number(pt.totalBetAmount || 0);
-    const totalWinnings = Number(pt.totalWinnings ?? pt.liveWinnings ?? 0);
-    const totalLoss = Number(pt.totalLossAmount ?? pt.liveLossAmount ?? 0);
-    // The single source of truth for P&L. Do not replace it with wallet delta:
-    // wallet balance can also change because of deposits, withdrawals, etc.
-    pt.totalProfit = totalWinnings - totalInvestment;
-    pt.pnl = pt.totalProfit;
-    pt.liveWinnings = totalWinnings;
-    pt.liveLossAmount = totalLoss;
-
-    const balanceText = balance.success ? '₹' + Number(pt.liveBalance).toFixed(2) : 'Unavailable';
+    const totalWinnings = Number(pt.liveWinnings || 0);
+    const totalLoss = Number(pt.liveLossAmount || 0);
+    const ledgerPnl = (Number(pt.totalWinProfit) || 0) - (Number(pt.totalLossAmount) || 0);
+    const sign = netProfit >= 0 ? '+' : '-';
+    const balanceText = balance.success ? '₹' + currentLiveBalance.toFixed(2) : 'Unavailable';
     const title = label === 'Profit' ? '✅ WINNINGS' : '❌ LOSS';
     const periodText = label === 'Profit'
-        ? `Winnings: +₹${grossWinnings.toFixed(2)}\nProfit: ${periodProfit >= 0 ? '+' : '-'}₹${Math.abs(periodProfit).toFixed(2)}`
+        ? `Winnings: +₹${grossWinnings.toFixed(2)}\nProfit: ${sign}₹${Math.abs(netProfit).toFixed(2)}`
         : `Loss: -₹${lossAmount.toFixed(2)}\nProfit: -₹${lossAmount.toFixed(2)}`;
-
     await send(chatId,
         title + '\n' +
         `Investment: ₹${investment.toFixed(2)}\n` +
         periodText + '\n' +
         `Live Balance: ${balanceText}\n` +
-        `Total Investment: ₹${totalInvestment.toFixed(2)}\n` +
         `Total Winnings: +₹${totalWinnings.toFixed(2)}\n` +
-        `Total Profit: ${pt.totalProfit >= 0 ? '+' : '-'}₹${Math.abs(pt.totalProfit).toFixed(2)}\n` +
-        `Total Loss: -₹${totalLoss.toFixed(2)}`
-    );
+        `Total Profit: ${ledgerPnl >= 0 ? '+' : '-'}₹${Math.abs(ledgerPnl).toFixed(2)}\n` +
+        `Total Loss: -₹${totalLoss.toFixed(2)}`);
     delete pt.activeBetSnapshot;
 }
 // ============================================================
@@ -3900,61 +3915,67 @@ async function sendResultAmountLine(chatId, userId, label, amount, settlement = 
 async function handleWin(userId, chatId, actual, num, betLevel, bets = [], settlement = null) {
     const pt = profitTrack[userId];
     const amt = bets.length ? bets.reduce((sum, b) => sum + Number(b.amt || 0), 0) : getSequenceAmount(userId, betLevel);
-    const investment = Math.max(0, Number(settlement?.totalStake ?? amt));
-    const grossWinnings = Math.max(0, Number(settlement?.payout ?? (investment + (Number(amt) * (autobetCfg[userId].mode === 'NUMBER' ? NUMBER_WIN_MULTIPLIER - 1 : SIZE_WIN_MULTIPLIER - 1)))));
-    const profit = grossWinnings - investment;
-
-    pt.totalBets++; pt.wins++;
-    pt.totalBetAmount = (Number(pt.totalBetAmount) || 0) + investment;
-    pt.totalWinnings = (Number(pt.totalWinnings) || 0) + grossWinnings;
-    pt.totalProfit = pt.totalWinnings - pt.totalBetAmount;
-    pt.pnl = pt.totalProfit;
-    pt.totalWinProfit = (Number(pt.totalWinProfit) || 0) + profit;
+    let profit;
+    profit = settlement ? Number(settlement.pnl) || 0 : amt * (autobetCfg[userId].mode === "NUMBER" ? NUMBER_WIN_MULTIPLIER - 1 : SIZE_WIN_MULTIPLIER - 1);
+    
+    pt.totalBets++; pt.wins++; pt.pnl += profit;
+    pt.totalWinProfit = (Number(pt.totalWinProfit) || 0) + Math.max(0, profit);
+    pt.pnl = (Number(pt.totalWinProfit) || 0) - (Number(pt.totalLossAmount) || 0);
     pt.lastPeriodProfit = profit;
-    pt.lastPeriodGrossWinnings = grossWinnings;
+    pt.totalBetAmount = (pt.totalBetAmount || 0) + amt;
     pt.winStreak++; pt.lossStreak = 0;
     if(pt.winStreak > pt.maxW) pt.maxW = pt.winStreak;
-
     const plan = autobetCfg[userId].profitPlan;
     const switchStep = Math.floor(Number(plan?.profitSwitchStep) || 0);
-    const shouldSwitchPlan = plan?.enabled && switchStep > 0 && pt.totalProfit >= Number(plan.nextProfitSwitch || switchStep);
+    const shouldSwitchPlan = plan?.enabled && switchStep > 0 && pt.pnl >= Number(plan.nextProfitSwitch || switchStep);
     if (shouldSwitchPlan) {
         const previousLevel = Number(plan?.currentLevel) || 1;
-        await refreshWalletPlan(userId, 'win');
-        if (plan?.enabled && switchStep > 0) plan.nextProfitSwitch = (Math.floor(pt.totalProfit / switchStep) + 1) * switchStep;
+        await refreshWalletPlan(userId, "win");
+        if (plan?.enabled && switchStep > 0) {
+            plan.nextProfitSwitch = (Math.floor(pt.pnl / switchStep) + 1) * switchStep;
+        }
         if (plan?.enabled) {
             const currentLevel = Number(plan.currentLevel) || 1;
-            const sizePlan = (autobetCfg[userId].customSizeBets || []).slice(0, autobetCfg[userId].maxLvl).join(' → ₹');
-            const numberPlan = (autobetCfg[userId].customNumberBets || []).slice(0, autobetCfg[userId].maxLvl).join(' → ₹');
-            await send(chatId, '🔄 Plan switched: L' + previousLevel + ' → L' + currentLevel + '\nSize: ₹' + sizePlan + '\nNumber: ₹' + numberPlan);
+            const sizePlan = (autobetCfg[userId].customSizeBets || []).slice(0, autobetCfg[userId].maxLvl).join(" → ₹");
+            const numberPlan = (autobetCfg[userId].customNumberBets || []).slice(0, autobetCfg[userId].maxLvl).join(" → ₹");
+            await send(chatId,
+                "🔄 Plan switched: L" + previousLevel + " → L" + currentLevel +
+                "\nSize: ₹" + sizePlan +
+                "\nNumber: ₹" + numberPlan
+            );
         }
     }
+
     await sendSticker(chatId, WIN_STICKER);
-    await sendResultAmountLine(chatId, userId, 'Profit', profit, { totalStake: investment, payout: grossWinnings });
+    await sendResultAmountLine(chatId, userId, "Profit", profit, settlement);
 }
 
+// ============================================================
+// 3. handleLoss - UI & Stats
+// ============================================================
 async function handleLoss(userId, chatId, actual, num, betLevel, bets = [], settlement = null) {
     const st = autobetState[userId];
     const pt = profitTrack[userId];
     const amt = bets.length ? bets.reduce((sum, b) => sum + Number(b.amt || 0), 0) : getSequenceAmount(userId, betLevel);
-    const investment = Math.max(0, Number(settlement?.totalStake ?? amt));
-    const periodLoss = -investment;
-
-    pt.totalBets++; pt.losses++;
-    pt.totalBetAmount = (Number(pt.totalBetAmount) || 0) + investment;
-    pt.totalLossAmount = (Number(pt.totalLossAmount) || 0) + investment;
-    pt.totalProfit = (Number(pt.totalWinnings) || 0) - pt.totalBetAmount;
-    pt.pnl = pt.totalProfit;
+    
+    const periodLoss = settlement ? Number(settlement.pnl) || 0 : -amt;
+    pt.totalBets++; pt.losses++; pt.pnl += periodLoss;
+    pt.totalLossAmount = (Number(pt.totalLossAmount) || 0) + Math.abs(periodLoss);
+    pt.pnl = (Number(pt.totalWinProfit) || 0) - (Number(pt.totalLossAmount) || 0);
     pt.lastPeriodProfit = periodLoss;
-    pt.lastPeriodLossAmount = investment;
+    pt.totalBetAmount = (pt.totalBetAmount || 0) + amt;
     pt.lossStreak++; pt.winStreak = 0;
     if(pt.lossStreak > pt.maxL) pt.maxL = pt.lossStreak;
 
     const plan = autobetCfg[userId].profitPlan;
-    if (plan?.enabled && plan?.profitSwitchStep > 0 && pt.totalProfit <= 0) await refreshWalletPlan(userId, 'loss');
+    if (plan?.enabled && plan?.profitSwitchStep > 0 && pt.pnl <= 0) {
+        await refreshWalletPlan(userId, "loss");
+    }
+
     await sendSticker(chatId, LOSS_STICKER);
-    await sendResultAmountLine(chatId, userId, 'Loss', investment, { totalStake: investment, payout: 0 });
+    await sendResultAmountLine(chatId, userId, "Loss", amt, settlement);
 }
+
 // ============================================================
 // PREDICT LOOP
 // ============================================================
@@ -4003,7 +4024,7 @@ async function runPredict(userId, chatId) {
     if (st.isWaiting) {
         if (Date.now() >= st.nextStartTime) {
             st.isWaiting = false;
-            profitTrack[userId].pnl = 0; 
+            // Keep the cumulative session P&L across timed restarts.
             await send(chatId, "🔄 Timed Restart! Starting new section...");
         } else {
             scheduleRun(userId, chatId, 30000);
@@ -4505,9 +4526,7 @@ async function profitReport(chatId,userId){
     let balance = "❌ No token";
     const balResult = await getLiveBalance(userId);
     if(balResult.success){
-        balance = "₹"+Number(balResult.balance).toFixed(2);
-        pt.liveBalance = Number(balResult.balance) || 0;
-        pt.liveNet = pt.liveBalance - Number(pt.startBalance || 0);
+        balance = "₹"+balResult.balance;
     } else if (balResult.message){
         balance = "⚠️ "+balResult.message;
     }
@@ -4515,13 +4534,13 @@ async function profitReport(chatId,userId){
 "💰 PROFIT REPORT\n\n"+
 "Balance: "+balance+"\n"+
 "Bets   : "+pt.totalBets+"\nWins   : "+pt.wins+"\nLoss   : "+pt.losses+"\nRate   : "+rate+"%\n"+
-"P&L    : "+(Number(pt.totalProfit)>=0?"+":"")+Number(pt.totalProfit||0).toFixed(2)+"\n"+
-"Winnings: +₹"+Number(pt.totalWinnings ?? pt.liveWinnings ?? 0).toFixed(2)+" | Loss Total: -₹"+Number(pt.totalLossAmount ?? pt.liveLossAmount ?? 0).toFixed(2)+"\n"+
+"P&L    : "+((Number(pt.pnl)||0)>=0?"+":"")+(Number(pt.pnl)||0).toFixed(2)+"\n"+
+"Winnings: +₹"+Number(pt.liveWinnings ?? pt.totalWinProfit ?? 0).toFixed(2)+" | Loss Total: -₹"+Number(pt.liveLossAmount ?? pt.totalLossAmount ?? 0).toFixed(2)+"\n"+
 "Start Bal: ₹"+Number(pt.startBalance||0).toFixed(2)+" | Live Bal: ₹"+Number(pt.liveBalance||0).toFixed(2)+" | Live Net: "+(Number(pt.liveNet||0)>=0?"+":"-")+"₹"+Math.abs(Number(pt.liveNet||0)).toFixed(2)+"\n"+
 "Streak : "+pt.winStreak+"W / "+pt.lossStreak+"L\n"+
 "Streak hits: "+(pt.lossStreakHits||0)+" (threshold L"+(cfg.watchLoss||1)+")\n"+
 "Best W : "+Number(pt.maxW||0)+" | Max loss streak: "+Number(pt.maxL||0)+"\n"+
-"Investment: ₹"+Number(pt.totalBetAmount||0).toFixed(2)+"\n"+
+"Staked : ₹"+Number(pt.totalBetAmount||0).toFixed(2)+"\n"+
 "Level  : L"+autobetState[userId].level+" / "+cfg.maxLvl+"\n"+
 (cfg.profitPlan?.enabled ? "Plan   : ON | Balance ₹"+Number(cfg.profitPlan.planBalance||0).toFixed(0)+" | Max L"+cfg.profitPlan.maxLevel+"\n" : "Plan   : OFF\n")+
 "Profit switch: "+(cfg.profitPlan?.profitSwitchStep ? "Every ₹"+cfg.profitPlan.profitSwitchStep+" (next ₹"+cfg.profitPlan.nextProfitSwitch+")" : "OFF")+"\n"+
@@ -5225,7 +5244,7 @@ if(text==="🔢 Set Watch Losses"){
             predictionDispatches.set(String(id), new Set());
             settledPeriods.delete(String(id));
             autobetState[id]={...(autobetState[id]||{}),level:1,sizeLevel:1,numberLevel:1,consecutiveLoss:0,inMart:false,lastWinLevel:null,lastWinMode:null,waitingForWatchWin:false,watchWinStreak:0,lastOutcome:null};
-            if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].lastSettledBalance = null; profitTrack[id].activeBetSnapshot = null; profitTrack[id].liveNet = 0; profitTrack[id].pnl = 0; profitTrack[id].totalProfit = 0; profitTrack[id].totalBetAmount = 0; profitTrack[id].totalWinnings = 0; profitTrack[id].totalLossAmount = 0; profitTrack[id].liveWinnings = 0; profitTrack[id].liveLossAmount = 0; profitTrack[id].lastPeriodLiveDelta = 0; profitTrack[id].lastPeriodProfit = 0; }
+            if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].lastSettledBalance = null; profitTrack[id].activeBetSnapshot = null; profitTrack[id].liveNet = 0; profitTrack[id].pnl = 0; profitTrack[id].liveWinnings = 0; profitTrack[id].liveLossAmount = 0; profitTrack[id].lastPeriodLiveDelta = 0; profitTrack[id].lastPeriodProfit = 0; }
             // Capture the real wallet before the first bet, so live-net P&L
             // starts from the actual balance (for example ₹500.00).
             await getLiveBalance(id);
