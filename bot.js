@@ -1087,7 +1087,7 @@ async function fetchLuciferFullHistory() {
     try {
         const response = await axios.get(LUCIFER_FULL_HISTORY_URL + '?_=' + Date.now(), {
             headers: { 'Accept': 'application/json', 'Cache-Control': 'no-cache, no-store', 'Pragma': 'no-cache', 'User-Agent': 'Mozilla/5.0' },
-            timeout: 12000,
+            timeout: 5000,
             maxContentLength: 128 * 1024 * 1024,
             maxBodyLength: 128 * 1024 * 1024,
             validateStatus: status => status >= 200 && status < 300
@@ -1916,7 +1916,7 @@ async function getLiveBalance(userId, chatId = null) {
     };
 
     try {
-        const r = await axios.get(url, { headers, timeout: 10000 });
+        const r = await axios.get(url, { headers, timeout: 5000 });
         const parsed = await parseBalanceResponse(r);
         if (parsed.success) {
             if (!profitTrack[userId]) profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount: 0, lossStreakHits: 0 };
@@ -3830,16 +3830,29 @@ function getStatus(userId) {
 
 async function sendResultAmountLine(chatId, userId, label, amount) {
     const balance = await getLiveBalance(userId);
-    const pnl = Number(profitTrack[userId]?.pnl || 0);
+    const balanceTrack = profitTrack[userId] || {};
+    const currentLiveBalance = balance.success ? Number(balance.balance) || 0 : Number(balanceTrack.liveBalance || 0);
+    const previousSettledBalance = Number.isFinite(Number(balanceTrack.lastSettledBalance))
+        ? Number(balanceTrack.lastSettledBalance)
+        : Number(balanceTrack.startBalance || currentLiveBalance);
+    const balanceDelta = currentLiveBalance - previousSettledBalance;
+    if (balance.success) {
+        if (balanceDelta > 0) balanceTrack.liveWinnings = (Number(balanceTrack.liveWinnings) || 0) + balanceDelta;
+        if (balanceDelta < 0) balanceTrack.liveLossAmount = (Number(balanceTrack.liveLossAmount) || 0) + Math.abs(balanceDelta);
+        balanceTrack.lastSettledBalance = currentLiveBalance;
+        balanceTrack.pnl = currentLiveBalance - Number(balanceTrack.startBalance || currentLiveBalance);
+        balanceTrack.lastPeriodLiveDelta = balanceDelta;
+    }
+    const pnl = Number(balanceTrack.pnl || 0);
     const balanceText = balance.success
-        ? "₹" + Math.floor(Number(balance.balance) || 0)
+        ? "₹" + Number(currentLiveBalance).toFixed(2)
         : "Unavailable";
     const sign = label === "Profit" ? "+" : "-";
     const liveNet = Number(profitTrack[userId]?.liveNet || 0);
-    const totalWin = Number(profitTrack[userId]?.totalWinProfit || 0);
-    const totalLoss = Number(profitTrack[userId]?.totalLossAmount || 0);
+    const totalWin = Number(balanceTrack.liveWinnings ?? balanceTrack.totalWinProfit ?? 0);
+    const totalLoss = Number(balanceTrack.liveLossAmount ?? balanceTrack.totalLossAmount ?? 0);
     await send(chatId, label + ": " + sign + "₹" + Math.floor(Math.abs(Number(amount) || 0)) +
-        " | Period: " + (label === "Profit" ? "+" : "-") + "₹" + Math.floor(Math.abs(Number(amount) || 0)) +
+        " | Period: " + (balanceTrack.lastPeriodLiveDelta >= 0 ? "+" : "-") + "₹" + Math.abs(Number(balanceTrack.lastPeriodLiveDelta || 0)).toFixed(2) +
         " | Live Balance: " + balanceText +
         " | Live Net: " + (liveNet >= 0 ? "+" : "-") + "₹" + Math.floor(Math.abs(liveNet)) +
         " | Total Profit: " + (pnl >= 0 ? "+" : "-") + "₹" + Math.floor(Math.abs(pnl)) +
@@ -3882,8 +3895,8 @@ async function handleWin(userId, chatId, actual, num, betLevel, bets = [], settl
         }
     }
 
-    await sendResultAmountLine(chatId, userId, "Profit", profit);
     await sendSticker(chatId, WIN_STICKER);
+    await sendResultAmountLine(chatId, userId, "Profit", profit);
 }
 
 // ============================================================
@@ -3907,8 +3920,8 @@ async function handleLoss(userId, chatId, actual, num, betLevel, bets = [], sett
         await refreshWalletPlan(userId, "loss");
     }
 
-    await sendResultAmountLine(chatId, userId, "Loss", amt);
     await sendSticker(chatId, LOSS_STICKER);
+    await sendResultAmountLine(chatId, userId, "Loss", amt);
 }
 
 // ============================================================
@@ -4191,7 +4204,7 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
             releaseResultCheck();
             return;
         }
-        if (++tries > 25) {
+        if (++tries > 45) {
             releaseResultCheck();
             await logBoth(chatId, "⏱ Timeout — checking next period...");
             scheduleRun(userId, chatId, 15000);
@@ -4205,12 +4218,12 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
         }
         if (!/^\d+$/.test(String(list[0]?.issueNumber || ""))) {
             releaseResultCheck();
-            scheduleRun(userId, chatId, 5000);
+            scheduleRun(userId, chatId, 1500);
             return;
         }
         if (BigInt(list[0].issueNumber) < BigInt(target)) {
             callbackBusy = false;
-            iv = setTimeout(tick, 10000);
+            iv = setTimeout(tick, 1500);
             resultCheckTimers.set(timerKey, iv);
             return;
         }
@@ -4218,7 +4231,7 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
 
         const res = list.find(i => String(i.issueNumber) === String(target));
         if (!res) {
-            scheduleRun(userId, chatId, 5000);
+            scheduleRun(userId, chatId, 1500);
             return;
         }
         const num = parseInt(res.number || res.winNumber, 10);
@@ -4391,7 +4404,7 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
         });
         userStates[userId].resultHistory = predictionHistory.slice(0, 100);
 
-        scheduleRun(userId, chatId, 8000);
+        scheduleRun(userId, chatId, 1500);
         } catch (error) {
             const settled = settledPeriods.get(timerKey);
             settled?.delete(String(target));
@@ -4402,7 +4415,7 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
             callbackBusy = false;
         }
     };
-    iv = setTimeout(tick, 7000);
+    iv = setTimeout(tick, 1200);
     resultCheckTimers.set(timerKey, iv);
 }
 
@@ -4433,8 +4446,8 @@ function showStats(chatId,userId){
 "Loss streak : "+(d.lossStreak||0)+" | Worst: "+(d.maxLossStreak||0)+"\n"+
 "Streak hits : "+(pt.lossStreakHits||0)+" (threshold L"+(autobetCfg[userId].watchLoss||1)+")\n"+
 "P&L         : "+(pt.pnl>=0?"+":"")+Number(pt.pnl||0).toFixed(2)+"\n"+
-"Winnings    : +₹"+Number(pt.totalWinProfit||0).toFixed(2)+"\n"+
-"Loss Total  : -₹"+Number(pt.totalLossAmount||0).toFixed(2)+"\n"+
+"Winnings    : +₹"+Number(pt.liveWinnings ?? pt.totalWinProfit ?? 0).toFixed(2)+"\n"+
+"Loss Total  : -₹"+Number(pt.liveLossAmount ?? pt.totalLossAmount ?? 0).toFixed(2)+"\n"+
 "Start Bal   : ₹"+Number(pt.startBalance||0).toFixed(2)+" | Live Bal: ₹"+Number(pt.liveBalance||0).toFixed(2)+"\n"+
 "Live Net    : "+(Number(pt.liveNet||0)>=0?"+":"-")+"₹"+Math.abs(Number(pt.liveNet||0)).toFixed(2)+"\n"+
 "Staked      : ₹"+Number(pt.totalBetAmount||0).toFixed(2)+"\n\n"+
@@ -4460,7 +4473,7 @@ async function profitReport(chatId,userId){
 "Balance: "+balance+"\n"+
 "Bets   : "+pt.totalBets+"\nWins   : "+pt.wins+"\nLoss   : "+pt.losses+"\nRate   : "+rate+"%\n"+
 "P&L    : "+(pt.pnl>=0?"+":"")+pt.pnl.toFixed(2)+"\n"+
-"Winnings: +₹"+Number(pt.totalWinProfit||0).toFixed(2)+" | Loss Total: -₹"+Number(pt.totalLossAmount||0).toFixed(2)+"\n"+
+"Winnings: +₹"+Number(pt.liveWinnings ?? pt.totalWinProfit ?? 0).toFixed(2)+" | Loss Total: -₹"+Number(pt.liveLossAmount ?? pt.totalLossAmount ?? 0).toFixed(2)+"\n"+
 "Start Bal: ₹"+Number(pt.startBalance||0).toFixed(2)+" | Live Bal: ₹"+Number(pt.liveBalance||0).toFixed(2)+" | Live Net: "+(Number(pt.liveNet||0)>=0?"+":"-")+"₹"+Math.abs(Number(pt.liveNet||0)).toFixed(2)+"\n"+
 "Streak : "+pt.winStreak+"W / "+pt.lossStreak+"L\n"+
 "Streak hits: "+(pt.lossStreakHits||0)+" (threshold L"+(cfg.watchLoss||1)+")\n"+
@@ -5169,7 +5182,7 @@ if(text==="🔢 Set Watch Losses"){
             predictionDispatches.set(String(id), new Set());
             settledPeriods.delete(String(id));
             autobetState[id]={...(autobetState[id]||{}),level:1,sizeLevel:1,numberLevel:1,consecutiveLoss:0,inMart:false,lastWinLevel:null,lastWinMode:null,waitingForWatchWin:false,watchWinStreak:0,lastOutcome:null};
-            if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].liveNet = 0; profitTrack[id].lastPeriodProfit = 0; }
+            if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].lastSettledBalance = null; profitTrack[id].liveNet = 0; profitTrack[id].pnl = 0; profitTrack[id].liveWinnings = 0; profitTrack[id].liveLossAmount = 0; profitTrack[id].lastPeriodLiveDelta = 0; profitTrack[id].lastPeriodProfit = 0; }
             // Capture the real wallet before the first bet, so live-net P&L
             // starts from the actual balance (for example ₹500.00).
             await getLiveBalance(id);
