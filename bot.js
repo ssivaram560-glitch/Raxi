@@ -1965,7 +1965,7 @@ function initUser(id) {
     for (const field of ["total", "win", "loss", "lossStreak", "winStreak", "maxWinStreak", "maxLossStreak"]) {
         if (!Number.isFinite(Number(stats[id][field])) || stats[id][field] < 0) stats[id][field] = 0;
     }
-   if (!userStates[id])   userStates[id]   = { resultHistory:[], skipCount:0, currentMode:null, lastPrediction:null, sizePredictionMode:'ANALYSIS', sixPredictionLock:null, activeSixChannel:null, channelLosses:{ SIZE:0, COLOR:0 }, channelSwitches:0, skipPeriodsRemaining:0, lastFiveSameIssue:null, fiveSameSkipActive:false, specialPatternSkipActive:false, lastWinPattern:null, lastWinChannel:null, lastSamePatternSwitchIssue:null };
+   if (!userStates[id])   userStates[id]   = { resultHistory:[], skipCount:0, currentMode:null, lastPrediction:null, sizePredictionMode:'ANALYSIS', sixPredictionLock:null, activeSixChannel:null, channelLosses:{ SIZE:0, COLOR:0 }, channelSwitches:0, skipPeriodsRemaining:0, lastFiveSameIssue:null, fiveSameSkipActive:false, specialPatternSkipActive:false, lastWinPattern:null, lastWinChannel:null, lastSamePatternSwitchIssue:null, colorLossStreak:0, colorRecoveryLosses:0 };
     if (!sentPeriods[id])  sentPeriods[id]  = new Set();
     if (!autobetCfg[id])   autobetCfg[id]   = { 
         watch:false, 
@@ -1974,9 +1974,10 @@ function initUser(id) {
         baseBet:1, 
         maxLvl:5, 
         enabled:false,
-        mode:"SIZE", // SIZE, COLOR, NUMBER, or COMBINED
+        mode:"SIZE", // SIZE, COLOR, COLOR_NUMBER, NUMBER, or COMBINED
         customBets:[1,3,9,27,81],
         customSizeBets:[1,2,4,8,16],
+        customColorBets:[1,2,4,8,16],
         customNumberBets:[1,9,81,729,6561],
         targetProfit: 1000,    // NEW: Profit target set panna
         restartDelay: 1,       // NEW: Restart time (hours) set panna
@@ -1988,9 +1989,10 @@ function initUser(id) {
             nextProfitSwitch: 0
         }
     };
-    if (!["SIZE", "COLOR", "NUMBER", "COMBINED"].includes(autobetCfg[id].mode)) autobetCfg[id].mode = "SIZE";
+    if (!["SIZE", "COLOR", "COLOR_NUMBER", "NUMBER", "COMBINED"].includes(autobetCfg[id].mode)) autobetCfg[id].mode = "SIZE";
     if (!Array.isArray(autobetCfg[id].customBets) || !autobetCfg[id].customBets.length) autobetCfg[id].customBets = [1,3,9,27,81];
     if (!Array.isArray(autobetCfg[id].customSizeBets) || !autobetCfg[id].customSizeBets.length) autobetCfg[id].customSizeBets = [1,2,4,8,16];
+    if (!Array.isArray(autobetCfg[id].customColorBets) || !autobetCfg[id].customColorBets.length) autobetCfg[id].customColorBets = [1,2,4,8,16];
     if (!Array.isArray(autobetCfg[id].customNumberBets) || !autobetCfg[id].customNumberBets.length) autobetCfg[id].customNumberBets = [1,9,81,729,6561];
     if (!autobetState[id]) autobetState[id] = { 
         level:1,
@@ -2539,17 +2541,17 @@ function buildBSFromList(list, count = 15) {
 }
 
 function initState(userId) {
-    if (!userStates[userId]) userStates[userId] = { lastSitePrediction: null, resultHistory: [], mode: 'NORMAL', pastedMode: false, nextPredictionMode: 'SIZE', combinedFlipNext: false, recoveryCount: 0, winBeforeLoss: 0, lossStreak: 0, history: [], sixPredictionLock:null, activeSixChannel:null, channelLosses:{ SIZE:0, COLOR:0 }, channelSwitches:0, skipPeriodsRemaining:0, lastFiveSameIssue:null, fiveSameSkipActive:false, specialPatternSkipActive:false, lastWinPattern:null, lastWinChannel:null, lastSamePatternSwitchIssue:null };
+    if (!userStates[userId]) userStates[userId] = { lastSitePrediction: null, resultHistory: [], mode: 'NORMAL', pastedMode: false, nextPredictionMode: 'SIZE', combinedFlipNext: false, recoveryCount: 0, winBeforeLoss: 0, lossStreak: 0, history: [], sixPredictionLock:null, activeSixChannel:null, channelLosses:{ SIZE:0, COLOR:0 }, channelSwitches:0, skipPeriodsRemaining:0, lastFiveSameIssue:null, fiveSameSkipActive:false, specialPatternSkipActive:false, lastWinPattern:null, lastWinChannel:null, lastSamePatternSwitchIssue:null, colorLossStreak:0, colorRecoveryLosses:0 };
     if (!Array.isArray(userStates[userId].resultHistory)) userStates[userId].resultHistory = [];
 }
 
 function modeLabel(mode) {
-    return mode === "NUMBER" ? "NUMBER" : mode === "COLOR" ? "COLOR" : mode === "COMBINED" ? "BIG/SMALL + NUMBER" : "BIG/SMALL";
+    return mode === "NUMBER" ? "NUMBER" : mode === "COLOR_NUMBER" ? "COLOR + NUMBER" : mode === "COLOR" ? "COLOR" : mode === "COMBINED" ? "BIG/SMALL + NUMBER" : "BIG/SMALL";
 }
 
 function getSequenceAmount(userId, level, kind = "default") {
     const cfg = autobetCfg[userId] || {};
-    const seq = cfg.mode === "COMBINED" ? (kind === "number" ? cfg.customNumberBets : cfg.customSizeBets) : cfg.customBets;
+    const seq = cfg.mode === "COMBINED" ? (kind === "number" ? cfg.customNumberBets : cfg.customSizeBets) : cfg.mode === "COLOR_NUMBER" ? (kind === "number" ? cfg.customNumberBets : cfg.customColorBets) : cfg.mode === "COLOR" ? cfg.customColorBets : cfg.customBets;
     return Number(seq?.[level - 1] ?? (cfg.baseBet * (MULT[level - 1] || 1)));
 }
 
@@ -2729,7 +2731,7 @@ function formatPrediction(signal) {
     if (!signal || signal.skip === true) return "SKIP";
     if (signal.type === "NUMBER") return String(Number(signal.val));
     if (signal.type === "SIZE") return String(signal.val || "").toUpperCase();
-    if (signal.type === "COLOR") return String(signal.val || "").toUpperCase();
+    if (signal.type === "COLOR" || signal.type === "COLOR_NUMBER") return String(signal.val || "").toUpperCase();
     if (signal.type === "COMBINED") {
         const size = String(signal.val || "").toUpperCase();
         const number = signal.number ?? signal.bets?.find(b => b.type === "NUMBER")?.val;
@@ -3545,61 +3547,38 @@ function calculateDifferenceSizePrediction(list, state = {}) {
 }
 
 function calculateFormulaChannelPrediction(list, state = {}) {
-    if (!Array.isArray(list) || list.length < 2 || !list[0]) return null;
-
+    if (!Array.isArray(list) || !list[0]) return null;
+    const currentNumber = Number.parseInt(list[0].number ?? list[0].winNumber ?? '', 10);
     const currentPeriod = String(list[0].issueNumber ?? list[0].issue ?? '');
-    const currentResult = Number.parseInt(list[0].number ?? list[0].winNumber ?? '', 10);
-    if (!/^\d+$/.test(currentPeriod) || !Number.isInteger(currentResult) || currentResult < 0 || currentResult > 9) return null;
-
+    if (!/^\d+$/.test(currentPeriod) || !Number.isInteger(currentNumber) || currentNumber < 0 || currentNumber > 9) return null;
     let nextPeriod;
-    try { nextPeriod = (BigInt(currentPeriod) + 1n).toString(); }
-    catch (_) { return null; }
-
-    const nextLast3Num = Number.parseInt(nextPeriod.slice(-3), 10);
-    if (!Number.isFinite(nextLast3Num)) return null;
-    const answer = nextLast3Num * Math.exp(currentResult);
-    const noDecimal = String(answer).replace('.', '');
-    const first14 = noDecimal.substring(0, 14);
-    const lastDigit = Number.parseInt(first14.charAt(first14.length - 1), 10);
-    if (!Number.isInteger(lastDigit) || lastDigit < 0 || lastDigit > 9) return null;
-
-    const channel = state.activeChannel === 'SIZE' ? 'SIZE' : 'COLOR';
-    const mode = state.mode === 'RECOVERY' ? 'RECOVERY' : 'NORMAL';
-    let prediction;
-    let type;
-    if (channel === 'SIZE') {
-        prediction = lastDigit <= 4 ? 'SMALL' : 'BIG';
-        type = 'SIZE';
-    } else {
-        prediction = lastDigit % 2 === 0 ? 'RED' : 'GREEN';
-        type = 'COLOR';
-    }
-    // Recovery uses the opposite output for the active channel.
-    if (mode === 'RECOVERY') {
-        prediction = channel === 'SIZE'
-            ? (prediction === 'SMALL' ? 'BIG' : 'SMALL')
-            : (prediction === 'RED' ? 'GREEN' : 'RED');
-    }
-
+    try { nextPeriod = (BigInt(currentPeriod) + 1n).toString(); } catch (_) { return null; }
+    const recovery = state.mode === 'RECOVERY';
+    const normalColor = currentNumber % 2 === 0 ? 'RED' : 'GREEN';
+    const color = recovery ? (normalColor === 'RED' ? 'GREEN' : 'RED') : normalColor;
+    const colorNumbers = color === 'RED' ? [0, 2, 4, 6, 8] : [1, 3, 5, 7, 9];
+    const isColorNumber = state.predictionMode === 'COLOR_NUMBER';
+    const bets = [{ type: 'COLOR', val: color, kind: 'color' }];
+    if (isColorNumber) colorNumbers.forEach(number => bets.push({ type: 'NUMBER', val: number, kind: 'number' }));
     return {
-        type,
-        val: prediction,
-        mode,
-        channel,
-        pat: `FORMULA-${channel}-${mode}`,
-        source: 'FORMULA_LAST_DIGIT_CHANNEL',
-        conf: 90,
+        type: isColorNumber ? 'COLOR_NUMBER' : 'COLOR',
+        val: color,
+        numbers: colorNumbers,
+        mode: recovery ? 'RECOVERY' : 'NORMAL',
+        channel: 'COLOR',
+        pat: isColorNumber ? 'PARITY-COLOR-NUMBERS' : 'PARITY-COLOR',
+        source: 'DIRECT_NUMBER_PARITY',
+        conf: 100,
         currentPeriod,
-        currentResult,
+        currentResult: currentNumber,
         nextPeriod,
-        calculatedAnswer: answer,
-        lastDigit,
-        colorRule: 'EVEN=RED, ODD=GREEN',
-        sizeRule: '0-4=SMALL, 5-9=BIG',
-        bets: [{ type, val: prediction, kind: type === 'COLOR' ? 'color' : 'size' }]
+        normalColor,
+        recovery,
+        colorRule: '0,2,4,6,8=RED; 1,3,5,7,9=GREEN',
+        decisionReason: `${recovery ? 'RECOVERY opposite' : 'NORMAL'}: ${currentNumber} -> ${normalColor} -> ${color}${isColorNumber ? ' numbers ' + colorNumbers.join(',') : ''}`,
+        bets
     };
 }
-
 // Backward-compatible name for any internal callers.
 function calculateFormulaColorPrediction(list, state = {}) {
     return calculateFormulaChannelPrediction(list, { ...state, activeChannel: 'COLOR' });
@@ -3627,6 +3606,20 @@ async function decidePrediction(list, currentLevel, userId) {
             state.lastPredictionChannel = 'SIZE';
             state.lastPredictionMode = signal.mode;
             state.sizePredictionMode = signal.mode;
+            state.lastPredictionValue = signal.val;
+        }
+        return signal;
+    }
+    if (cfg.mode === 'COLOR' || cfg.mode === 'COLOR_NUMBER') {
+        state.activeChannel = 'COLOR';
+        state.activeSixChannel = 'COLOR';
+        state.predictionMode = cfg.mode;
+        if (state.mode !== 'RECOVERY') state.mode = 'NORMAL';
+        state.nextPredictionMode = state.mode;
+        const signal = calculateFormulaChannelPrediction(list, state);
+        if (signal) {
+            state.lastPredictionChannel = 'COLOR';
+            state.lastPredictionMode = signal.mode;
             state.lastPredictionValue = signal.val;
         }
         return signal;
@@ -3770,25 +3763,55 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
             st.watchWinStreak = 0;
             recordLossStreakHit(userId);
         }
-    } else if (st && cfg.enabled && cfg.mode === 'COLOR') {
-        const channelBefore = state.lastPredictionChannel === 'SIZE' ? 'SIZE' : 'COLOR';
-        const modeBefore = state.lastPredictionMode === 'RECOVERY' ? 'RECOVERY' : 'NORMAL';
-        if (wasWin) {
-            st.waitingForWatchWin = false;
-            st.watchWinStreak = 0;
-            state.mode = 'NORMAL'; state.activeChannel = channelBefore;
-            st.lastOutcome = modeBefore === 'RECOVERY' ? 'RECOVERY_WIN' : 'WIN';
-            if (modeBefore === 'RECOVERY') { st.level = 1; st.sizeLevel = 1; st.numberLevel = 1; st.inMart = false; st.consecutiveLoss = 0; }
+    } else if (st && cfg.enabled && (cfg.mode === 'COLOR' || cfg.mode === 'COLOR_NUMBER')) {
+        // Color modes: NORMAL uses parity directly. Two consecutive NORMAL
+        // losses enter RECOVERY. Recovery reverses RED/GREEN. A recovery WIN
+        // stays in RECOVERY; a recovery LOSS returns to NORMAL and starts a
+        // fresh two-loss count.
+        const modeBefore = state.mode === 'RECOVERY' ? 'RECOVERY' : 'NORMAL';
+        if (modeBefore === 'NORMAL') {
+            if (wasWin) {
+                st.colorLossStreak = 0;
+                state.mode = 'NORMAL';
+                st.lastOutcome = 'COLOR_NORMAL_WIN';
+            } else {
+                st.colorLossStreak = Number(st.colorLossStreak || 0) + 1;
+                if (st.colorLossStreak >= 2) {
+                    state.mode = 'RECOVERY';
+                    st.colorRecoveryLosses = 0;
+                    st.lastOutcome = 'COLOR_2_LOSSES_TO_RECOVERY';
+                } else {
+                    state.mode = 'NORMAL';
+                    st.lastOutcome = 'COLOR_NORMAL_LOSS_1_OF_2';
+                }
+            }
         } else {
-            const next = channelBefore === 'COLOR' && modeBefore === 'NORMAL' ? {channel:'SIZE',mode:'NORMAL'} : channelBefore === 'SIZE' && modeBefore === 'NORMAL' ? {channel:'SIZE',mode:'RECOVERY'} : channelBefore === 'SIZE' ? {channel:'COLOR',mode:'RECOVERY'} : {channel:'COLOR',mode:'NORMAL'};
-            state.activeChannel = next.channel; state.mode = next.mode;
-            st.lastOutcome = `${channelBefore}_${modeBefore}_LOSS_TO_${next.channel}_${next.mode}`;
-            const maxLevel = Math.max(1, Number(cfg.maxLvl) || 1);
-            const level = Math.min(maxLevel, Math.max(1, Number(st.level) || 1));
-            st.level = level >= maxLevel ? 1 : level + 1; st.sizeLevel = st.level; st.numberLevel = st.level; st.inMart = st.level > 1; st.consecutiveLoss = Number(st.consecutiveLoss || 0) + 1;
+            if (wasWin) {
+                // Keep recovery active after a recovery win, as requested.
+                state.mode = 'RECOVERY';
+                st.colorRecoveryLosses = 0;
+                st.lastOutcome = 'COLOR_RECOVERY_WIN_STAY_RECOVERY';
+            } else {
+                state.mode = 'NORMAL';
+                st.colorLossStreak = 0;
+                st.colorRecoveryLosses = Number(st.colorRecoveryLosses || 0) + 1;
+                st.lastOutcome = 'COLOR_RECOVERY_LOSS_TO_NORMAL';
+            }
+        }
+        state.activeChannel = 'COLOR';
+        state.nextPredictionMode = state.mode;
+        st.level = wasWin ? 1 : Math.min(Math.max(1, Number(cfg.maxLvl) || 1), Number(st.level || 1) + 1);
+        st.sizeLevel = st.level; st.numberLevel = st.level;
+        st.inMart = st.level > 1;
+        if (!wasWin) {
             st.waitingForWatchWin = true;
             st.watchWinStreak = 0;
+            st.consecutiveLoss = Number(st.consecutiveLoss || 0) + 1;
             recordLossStreakHit(userId);
+        } else {
+            st.waitingForWatchWin = false;
+            st.watchWinStreak = 0;
+            st.consecutiveLoss = 0;
         }
     } else if (st && cfg.enabled) {
         // NUMBER mode uses the same level/watch rules as the other single-leg modes.
@@ -3827,6 +3850,11 @@ function formatMartingale(cfg) {
         return "Size: ₹" + cfg.customSizeBets.slice(0, cfg.maxLvl).join(" → ₹") +
             "\nNumber: ₹" + cfg.customNumberBets.slice(0, cfg.maxLvl).join(" → ₹");
     }
+    if (cfg.mode === "COLOR_NUMBER") {
+        return "Color: ₹" + cfg.customColorBets.slice(0, cfg.maxLvl).join(" → ₹") +
+            "\nNumbers: ₹" + cfg.customNumberBets.slice(0, cfg.maxLvl).join(" → ₹");
+    }
+    if (cfg.mode === "COLOR") return "Color: ₹" + cfg.customColorBets.slice(0, cfg.maxLvl).join(" → ₹");
     const sequence = cfg.mode === "NUMBER" ? cfg.customNumberBets : cfg.customBets;
     return "Bet: ₹" + sequence.slice(0, cfg.maxLvl).join(" → ₹");
 }
@@ -4165,7 +4193,8 @@ async function runPredict(userId, chatId) {
 "║ Best 5  : "+String(signal.bestFiveNumbers?.join(",") ?? "-")+"\n"+
 "║ Count   : S"+String(signal.smallCount ?? "-")+" / B"+String(signal.bigCount ?? "-")+"\n"+
 "║ Conf.   : "+String(signal.conf ?? signal.numberConfidence ?? "-")+"% | Measured "+String(signal.measuredAccuracy ?? "-")+"%\n"+
-"║ "+(signal.type === "COLOR" ? "Color   : " : "Size    : ")+signal.val+"\n"+
+"║ "+(signal.type === "COLOR" || signal.type === "COLOR_NUMBER" ? "Color   : " : "Size    : ")+signal.val+"\n"+
+"║ "+(signal.type === "COLOR_NUMBER" ? "Numbers : "+signal.numbers.join(",")+"\n" : "")+
 "║ Result  : "+formatPrediction(signal)+"\n"+
 "║ Source  : LUCIFER BEST-5 NUMBER ANALYSIS\n"+
 "╠══════════════════════════╣\n"+
@@ -4190,14 +4219,16 @@ waitLine+"\n"+
         const numberSpec = rawSpecs.find(spec => spec.type === "NUMBER");
         const specs = cfg.mode === "COMBINED"
             ? [sizeSpec, numberSpec].filter(Boolean)
-            : [colorSpec || sizeSpec || numberSpec].filter(Boolean);
+            : cfg.mode === "COLOR_NUMBER"
+                ? rawSpecs.filter(spec => spec.type === "COLOR" || spec.type === "NUMBER")
+                : [colorSpec || sizeSpec || numberSpec].filter(Boolean);
         const combinedAmounts = getCombinedBetAmounts(userId, st.sizeLevel, st.numberLevel);
         for (const spec of specs) {
             const isNumber = spec.type === "NUMBER";
             const levelForBet = cfg.mode === "COMBINED"
                 ? (isNumber ? combinedAmounts.numberLevel : combinedAmounts.sizeLevel)
                 : st.level;
-            const sequence = isNumber ? cfg.customNumberBets : cfg.customBets;
+            const sequence = isNumber ? cfg.customNumberBets : (cfg.mode === "COLOR_NUMBER" || cfg.mode === "COLOR" ? cfg.customColorBets : cfg.customBets);
             const amount = cfg.mode === "COMBINED"
                 ? (isNumber ? combinedAmounts.number : combinedAmounts.size)
                 : (sequence[levelForBet - 1] ?? (cfg.baseBet * (MULT[levelForBet - 1] || 1)));
@@ -4227,7 +4258,9 @@ waitLine+"\n"+
         ? rawPredictedBets.filter(spec => spec.type === "SIZE" || spec.type === "NUMBER")
         : cfg.mode === "NUMBER"
             ? rawPredictedBets.filter(spec => spec.type === "NUMBER")
-            : rawPredictedBets.filter(spec => spec.type === "SIZE" || spec.type === "COLOR");
+            : cfg.mode === "COLOR_NUMBER"
+                ? rawPredictedBets.filter(spec => spec.type === "COLOR" || spec.type === "NUMBER")
+                : rawPredictedBets.filter(spec => spec.type === "SIZE" || spec.type === "COLOR");
     checkResult(userId, chatId, next, signal.val, signal.type, placedBets, predictedBets);
     // Heartbeat fallback: checkResult normally schedules after settlement;
     // this timer guarantees recovery if a network/API edge case leaves it
@@ -4334,13 +4367,13 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
             ? Number(b.val) === num
             : b.type === "COLOR" ? String(b.val).toUpperCase() === actualColor
             : b.type === "SIZE" && b.val === actualSize);
-        if (cfg.mode === "COMBINED") {
+        if (cfg.mode === "COMBINED" || cfg.mode === "COLOR_NUMBER") {
             const predictedSize = evaluationBets.find(b => b.type === "SIZE")?.val || "-";
             const predictedNumber = evaluationBets.find(b => b.type === "NUMBER")?.val;
             const sizeStatus = sizeMatched ? "WIN ✅" : "LOSS ❌";
             const numberStatus = numberMatched ? "WIN ✅" : "LOSS ❌";
             await send(chatId,
-                "🎮 COMBINED RESULT\n" +
+                (cfg.mode === "COLOR_NUMBER" ? "🎨 COLOR+NUMBER RESULT\n" : "🎮 COMBINED RESULT\n") +
                 `Period: ${target}\n` +
                 `Size: ${predictedSize} → ${actualSize} (${sizeStatus})\n` +
                 `Number: ${predictedNumber ?? "-"} → ${num} (${numberStatus})\n` +
@@ -4483,6 +4516,28 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
 
 module.exports = { decidePrediction, updateAfterResult, getStatus, initState, buildBSFromList, runPredict, checkResult };
 
+function clearUserHistory(userId) {
+    initUser(userId);
+    stats[userId] = { total:0, win:0, loss:0, lossStreak:0, winStreak:0, maxWinStreak:0, maxLossStreak:0, levelWins:{}, sizeLevelWins:{}, numberLevelWins:{} };
+    const old = profitTrack[userId] || {};
+    profitTrack[userId] = { totalBets:0, wins:0, losses:0, pnl:0, winStreak:0, lossStreak:0, maxW:0, maxL:0, totalBetAmount:0, lossStreakHits:0, totalWinProfit:0, totalLossAmount:0, liveWinnings:0, liveLossAmount:0, liveNet:0, startBalance:null, liveBalance:old.liveBalance || 0, walletBalance:old.walletBalance || 0 };
+    userStates[userId].resultHistory = [];
+    userStates[userId].history = [];
+    userStates[userId].lastPrediction = null;
+    userStates[userId].colorLossStreak = 0;
+    userStates[userId].colorRecoveryLosses = 0;
+    userStates[userId].mode = 'NORMAL';
+    userStates[userId].activeChannel = 'COLOR';
+    userStates[userId].lastPredictionMode = 'NORMAL';
+    autobetState[userId].level = 1;
+    autobetState[userId].sizeLevel = 1;
+    autobetState[userId].numberLevel = 1;
+    autobetState[userId].inMart = false;
+    autobetState[userId].consecutiveLoss = 0;
+    autobetState[userId].waitingForWatchWin = false;
+    autobetState[userId].watchWinStreak = 0;
+    return send(userId, "🧹 Stats + Profit history cleared. New tracking starts from the next result.");
+}
 function showStats(chatId,userId){
     initUser(userId);
     const d = stats[userId];
@@ -4516,7 +4571,8 @@ function showStats(chatId,userId){
 "Level wins  : "+levelMapText(d.levelWins)+"\n"+
 "Level usage : "+levelMapText(st.levelHistory)+"\n"+
 "PRIMARY     : "+mappingLine(primary)+"\n"+
-"ALTERNATIVE : "+mappingLine(alternative)
+"ALTERNATIVE : "+mappingLine(alternative),
+        {reply_markup:{inline_keyboard:[[{text:"🧹 Clear Stats",callback_data:"clear_history"}]]}}
     );
 }
 async function profitReport(chatId,userId){
@@ -4545,7 +4601,8 @@ async function profitReport(chatId,userId){
 (cfg.profitPlan?.enabled ? "Plan   : ON | Balance ₹"+Number(cfg.profitPlan.planBalance||0).toFixed(0)+" | Max L"+cfg.profitPlan.maxLevel+"\n" : "Plan   : OFF\n")+
 "Profit switch: "+(cfg.profitPlan?.profitSwitchStep ? "Every ₹"+cfg.profitPlan.profitSwitchStep+" (next ₹"+cfg.profitPlan.nextProfitSwitch+")" : "OFF")+"\n"+
 "\n"+
-formatMartingale(cfg)
+formatMartingale(cfg),
+        {reply_markup:{inline_keyboard:[[{text:"🧹 Clear Profit History",callback_data:"clear_history"}]]}}
     );
 }
 async function autobetStatus(chatId, userId) {
@@ -4580,7 +4637,7 @@ async function autobetStatus(chatId, userId) {
 "Token    : "+(token.length>20?"✅":"❌")+"\n"+
 "AutoLogin: "+(creds.phone?"✅ "+creds.phone.slice(0,6)+"***":"❌")+"\n"+
 "Mode     : "+modeLabel(cfg.mode)+"\n"+
-    (cfg.mode === "COMBINED" ? "Size Bets: ₹"+cfg.customSizeBets.join(" → ₹")+"\nNum Bets : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule     : 1 site size + 1 site number\n" : "Bet Seq  : ₹"+cfg.customBets.join(" → ₹")+"\n")+
+    (cfg.mode === "COMBINED" ? "Size Bets: ₹"+cfg.customSizeBets.join(" → ₹")+"\nNum Bets : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule     : 1 site size + 1 site number\n" : cfg.mode === "COLOR_NUMBER" ? "Color Bets: ₹"+cfg.customColorBets.join(" → ₹")+"\nNum Bets  : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule      : Color + all matching numbers\n" : cfg.mode === "COLOR" ? "Color Bets: ₹"+cfg.customColorBets.join(" → ₹")+"\n" : "Bet Seq  : ₹"+cfg.customBets.join(" → ₹")+"\n")+
 "Watch    : "+(cfg.watch?"ON":"OFF")+"\n"+
 "WatchLoss: "+st.consecutiveLoss+"/"+cfg.watchLoss+"\n"+"WatchWins: "+getRequiredWatchWins(userId)+" consecutive\n"+
 "Bet Flow : "+(st.waitingForWatchWin ? "WATCH "+(st.watchWinStreak||0)+"/"+getRequiredWatchWins(userId)+" wins — then bet L"+st.level : "BET NEXT PERIOD")+"\n"+
@@ -4623,6 +4680,7 @@ const autobetMenu={keyboard:[
     ["🏆 Set Watch Wins"],
     ["📊 AutoBet Status","🔀 Customize Bet"],
     ["🎮 Mode: Big/Small","🎨 Mode: Color"],
+    ["🎨 Mode: Color+Number"],
     ["🔢 Mode: Number"],
     ["🔀 Mode: BigSmall+Number","🔙 Back"]
 ],resize_keyboard:true};
@@ -4689,9 +4747,23 @@ function startBot(){
 
 }
 
+const sendQueues = new Map();
 async function send(chatId,text,opts={}){
-    try{return await bot.sendMessage(chatId,text,opts);}
-    catch(e){if(e.message&&e.message.includes("parse entities")){try{const o={...opts};delete o.parse_mode;return await bot.sendMessage(chatId,text,o);}catch(e2){}}console.error("send:",e.message?.substr(0,60));}
+    const key = String(chatId);
+    const previous = sendQueues.get(key) || Promise.resolve();
+    const current = previous.catch(() => {}).then(async () => {
+        try { return await bot.sendMessage(chatId, text, opts); }
+        catch(e) {
+            if (e.message && e.message.includes("parse entities")) {
+                try { const o={...opts}; delete o.parse_mode; return await bot.sendMessage(chatId,text,o); } catch(e2) {}
+            }
+            console.error("send:", e.message?.substr(0,120));
+            return null;
+        }
+    });
+    sendQueues.set(key, current);
+    current.finally(() => { if (sendQueues.get(key) === current) sendQueues.delete(key); }).catch(() => {});
+    return current;
 }
 
 // Telegram messages have a size limit; preserve every member's details by
@@ -4862,6 +4934,10 @@ function addHandlers(){
         const chatId = cb.message && cb.message.chat ? cb.message.chat.id : id;
         try { await bot.answerCallbackQuery(cb.id); } catch (e) {}
 
+        if (data === "clear_history") {
+            if (!hasAccess(id)) return send(chatId, "❌ No access.");
+            return clearUserHistory(String(id));
+        }
         if (data === "login_menu_login") {
             return beginUserLogin(String(id), chatId);
         }
@@ -5033,7 +5109,7 @@ function addHandlers(){
 "Token    : "+(getToken(id).length>20?"✅ SET":"❌ MISSING")+"\n"+
 "AutoLogin: "+(creds.phone?"✅ "+creds.phone.slice(0,6)+"***":"❌ /setcreds  (or /setcredts)")+"\n"+
 "Mode     : "+modeLabel(cfg.mode)+"\n"+
-    (cfg.mode === "COMBINED" ? "Size Seq : ₹"+cfg.customSizeBets.join(" → ₹")+"\nNum Seq  : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule     : 1 site size + 1 site number\n" : "Bet Seq  : ₹"+cfg.customBets.join(" → ₹")+"\n")+
+    (cfg.mode === "COMBINED" ? "Size Seq : ₹"+cfg.customSizeBets.join(" → ₹")+"\nNum Seq  : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule     : 1 site size + 1 site number\n" : cfg.mode === "COLOR_NUMBER" ? "Color Seq : ₹"+cfg.customColorBets.join(" → ₹")+"\nNum Seq   : ₹"+cfg.customNumberBets.join(" → ₹")+"\nRule      : Color + all matching color numbers\n" : cfg.mode === "COLOR" ? "Color Seq : ₹"+cfg.customColorBets.join(" → ₹")+"\n" : "Bet Seq  : ₹"+cfg.customBets.join(" → ₹")+"\n")+
 "Watch    : "+(cfg.watch?"ON":"OFF")+"\n"+
 "WatchLoss: "+cfg.watchLoss+" consecutive\n"+"WatchWins: "+getRequiredWatchWins(id)+" consecutive\n"+
 "Base Bet : ₹"+cfg.baseBet+"\n"+
@@ -5076,7 +5152,12 @@ formatMartingale(cfg)+"\n\n"+
         if(text==="🎨 Mode: Color"){
             delete userAction[id];
             autobetCfg[id].mode="COLOR";
-            return send(id,"✅ Mode set: COLOR\nCOLOR loss → SIZE NORMAL → SIZE RECOVERY → COLOR RECOVERY.",{reply_markup:autobetMenu});
+            return send(id,"✅ Mode set: COLOR\nNORMAL: parity color\n2 consecutive losses → RECOVERY\nRECOVERY win stays RECOVERY; recovery loss → NORMAL.",{reply_markup:autobetMenu});
+        }
+        if(text==="🎨 Mode: Color+Number"){
+            delete userAction[id];
+            autobetCfg[id].mode="COLOR_NUMBER";
+            return send(id,"✅ Mode set: COLOR + NUMBER\nColor parity + all numbers under that color\nRED: 0,2,4,6,8 | GREEN: 1,3,5,7,9",{reply_markup:autobetMenu});
         }
         if(text==="🔢 Mode: Number"){
             delete userAction[id];
@@ -5103,8 +5184,12 @@ formatMartingale(cfg)+"\n\n"+
                 userAction[id]={action:"setcombinedcustom",step:"size"};
                 return send(id,"Enter BIG/SMALL level amounts (example: 1,2,4,8):");
             }
+            if (autobetCfg[id].mode === "COLOR_NUMBER") {
+                userAction[id]={action:"setcolornumbercustom",step:"color"};
+                return send(id,"Enter COLOR level amounts first (example: 1,2,4,8):");
+            }
             userAction[id]={action:"setsinglecustom",mode:autobetCfg[id].mode};
-            return send(id, autobetCfg[id].mode === "NUMBER" ? "Enter NUMBER bet level amounts (example: 1,9,81,729):" : autobetCfg[id].mode === "COLOR" ? "Enter COLOR bet level amounts (example: 1,2,4,8):" : "Enter BIG/SMALL bet level amounts (example: 1,2,4,8):");
+            return send(id, autobetCfg[id].mode === "NUMBER" ? "Enter NUMBER bet level amounts (example: 1,9,81,729):" : (autobetCfg[id].mode === "COLOR" || autobetCfg[id].mode === "COLOR_NUMBER") ? "Enter COLOR bet level amounts (example: 1,2,4,8):" : "Enter BIG/SMALL bet level amounts (example: 1,2,4,8):");
         }
 if(text==="🔢 Set Watch Losses"){
     userAction[id]={action:"setwloss"};
@@ -5173,11 +5258,25 @@ if(text==="🔢 Set Watch Losses"){
                 delete userAction[id];
                 return send(id, "✅ Section delay set to "+v+" minutes", {reply_markup: autobetMenu});
             }
+            else if(s.action === "setcolornumbercustom"){
+                const vals = text.split(/[, ]+/).map(v => parseInt(v.trim())).filter(v => Number.isInteger(v) && v > 0);
+                if(vals.length === 0) return send(id, "❌ Format error! Use: 1,2,4,8");
+                if (s.step === "color") {
+                    autobetCfg[id].customColorBets = vals;
+                    userAction[id] = {action:"setcolornumbercustom", step:"number", colorVals:vals};
+                    return send(id,"✅ Color levels saved. Now enter NUMBER level amounts (example: 1,2,4,8):");
+                }
+                autobetCfg[id].customNumberBets = vals;
+                autobetCfg[id].maxLvl = Math.max((s.colorVals || []).length, vals.length);
+                delete userAction[id];
+                return send(id,"✅ Color + Number custom bets updated!\nColor: ₹"+autobetCfg[id].customColorBets.join(" → ₹")+"\nNumbers: ₹"+vals.join(" → ₹"), {reply_markup: autobetMenu});
+            }
             else if(s.action === "setsinglecustom"){
                 const vals = text.split(/[, ]+/).map(v => parseInt(v.trim())).filter(v => Number.isInteger(v) && v > 0);
                 if(vals.length === 0) return send(id, "❌ Format error! Use: 1,2,4,8");
                 autobetCfg[id].customBets = vals;
                 if (s.mode === "NUMBER") autobetCfg[id].customNumberBets = [...vals];
+                else if (s.mode === "COLOR" || s.mode === "COLOR_NUMBER") autobetCfg[id].customColorBets = [...vals];
                 else autobetCfg[id].customSizeBets = [...vals];
                 autobetCfg[id].maxLvl = vals.length;
                 delete userAction[id];
@@ -5244,6 +5343,16 @@ if(text==="🔢 Set Watch Losses"){
             predictionDispatches.set(String(id), new Set());
             settledPeriods.delete(String(id));
             autobetState[id]={...(autobetState[id]||{}),level:1,sizeLevel:1,numberLevel:1,consecutiveLoss:0,inMart:false,lastWinLevel:null,lastWinMode:null,waitingForWatchWin:false,watchWinStreak:0,lastOutcome:null};
+            if (autobetCfg[id].mode === "COLOR" || autobetCfg[id].mode === "COLOR_NUMBER") {
+                initState(id);
+                userStates[id].mode = "NORMAL";
+                userStates[id].activeChannel = "COLOR";
+                userStates[id].activeSixChannel = "COLOR";
+                userStates[id].predictionMode = autobetCfg[id].mode;
+                userStates[id].lastPredictionMode = "NORMAL";
+                autobetState[id].colorLossStreak = 0;
+                autobetState[id].colorRecoveryLosses = 0;
+            }
             if (profitTrack[id]) { profitTrack[id].startBalance = null; profitTrack[id].lastSettledBalance = null; profitTrack[id].activeBetSnapshot = null; profitTrack[id].liveNet = 0; profitTrack[id].pnl = 0; profitTrack[id].liveWinnings = 0; profitTrack[id].liveLossAmount = 0; profitTrack[id].lastPeriodLiveDelta = 0; profitTrack[id].lastPeriodProfit = 0; }
             // Capture the real wallet before the first bet, so live-net P&L
             // starts from the actual balance (for example ₹500.00).
