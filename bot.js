@@ -3763,7 +3763,7 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
             st.watchWinStreak = 0;
             recordLossStreakHit(userId);
         }
-    } else if (st && cfg.enabled && (cfg.mode === 'COLOR' || cfg.mode === 'COLOR_NUMBER')) {
+    } else if (st && (cfg.mode === 'COLOR' || cfg.mode === 'COLOR_NUMBER')) {
         // Color modes: NORMAL uses parity directly. Two consecutive NORMAL
         // losses enter RECOVERY. Recovery reverses RED/GREEN. A recovery WIN
         // stays in RECOVERY; a recovery LOSS returns to NORMAL and starts a
@@ -3803,14 +3803,15 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
         st.level = wasWin ? 1 : Math.min(Math.max(1, Number(cfg.maxLvl) || 1), Number(st.level || 1) + 1);
         st.sizeLevel = st.level; st.numberLevel = st.level;
         st.inMart = st.level > 1;
+        // Color modes must continue placing the next bet so that two
+        // consecutive real losses can immediately activate RECOVERY.
+        // The generic WATCH pause would prevent loss #2 from being settled.
+        st.waitingForWatchWin = false;
+        st.watchWinStreak = 0;
         if (!wasWin) {
-            st.waitingForWatchWin = true;
-            st.watchWinStreak = 0;
             st.consecutiveLoss = Number(st.consecutiveLoss || 0) + 1;
             recordLossStreakHit(userId);
         } else {
-            st.waitingForWatchWin = false;
-            st.watchWinStreak = 0;
             st.consecutiveLoss = 0;
         }
     } else if (st && cfg.enabled) {
@@ -4162,16 +4163,18 @@ async function runPredict(userId, chatId) {
             : "🤖 AutoBet: OFF";
         canBet = false;
     } else if (!signal.fallback) {
-        // After every live-bet loss, prediction continues but staking pauses.
-        // A watch WIN unlocks the next period; watch losses keep the pause.
-        if (st.waitingForWatchWin) {
+        // Color and Color+Number modes require consecutive real settlements;
+        // never pause between their two losses. Other modes keep the existing
+        // watch behavior.
+        const directColorMode = cfg.mode === "COLOR" || cfg.mode === "COLOR_NUMBER";
+        if (st.waitingForWatchWin && !directColorMode) {
             canBet = false;
             abLine = "👀 WATCH MODE: " + Number(st.watchWinStreak || 0) + "/" + getRequiredWatchWins(userId) + " wins → next bet L" + st.level;
         } else {
             canBet = true;
-            const sequence = cfg.mode === "NUMBER" ? cfg.customNumberBets : cfg.customBets;
+            const sequence = cfg.mode === "NUMBER" ? cfg.customNumberBets : (directColorMode ? cfg.customColorBets : cfg.customBets);
             const curBet = sequence[st.level - 1] ?? (cfg.baseBet * (MULT[st.level - 1] || 1));
-            abLine = (st.level > 1 ? "📈 MART " : "💰 BET ") + "L" + st.level + ": ₹" + curBet;
+            abLine = (directColorMode ? "🎨 COLOR " : (st.level > 1 ? "📈 MART " : "💰 BET ")) + "L" + st.level + ": ₹" + curBet;
         }
     } else {
         canBet = false;
@@ -4185,9 +4188,9 @@ async function runPredict(userId, chatId) {
 "║    👑 EARN WITH ME AI    ║\n"+
 "╠══════════════════════════╣\n"+
 "║ Period  : "+next.slice(-6)+"\n"+
-"║ Game    : SIZE/COLOR\n"+
+"║ Game    : "+((cfg.mode === "COLOR" || cfg.mode === "COLOR_NUMBER") ? "COLOR" : "SIZE/COLOR")+"\n"+
 "║ 🎮 Mode  : "+String(signal.mode || (signal.type === "SIZE" ? state.sizePredictionMode : state.mode) || "NORMAL")+" "+String(signal.type === "SIZE" ? "BIG/SMALL" : (signal.channel || state.activeChannel || "COLOR"))+"\n"+
-"║ Mode    : "+String(signal.mode || signal.pat || "PATTERN-5/4")+"\n"+
+"║ Mode    : "+String(signal.mode || signal.pat || "NORMAL")+"\n"+
 "║ Pattern : "+String(signal.pattern || "LAST-5/LAST-4")+"\n"+
 "║ Number  : "+String(signal.number ?? "-")+"\n"+
 "║ Best 5  : "+String(signal.bestFiveNumbers?.join(",") ?? "-")+"\n"+
@@ -4196,7 +4199,7 @@ async function runPredict(userId, chatId) {
 "║ "+(signal.type === "COLOR" || signal.type === "COLOR_NUMBER" ? "Color   : " : "Size    : ")+signal.val+"\n"+
 "║ "+(signal.type === "COLOR_NUMBER" ? "Numbers : "+signal.numbers.join(",")+"\n" : "")+
 "║ Result  : "+formatPrediction(signal)+"\n"+
-"║ Source  : LUCIFER BEST-5 NUMBER ANALYSIS\n"+
+"║ Source  : "+String(signal.source || "DIRECT_NUMBER_PARITY")+"\n"+
 "╠══════════════════════════╣\n"+
 "║ "+abLine+"\n"+
 waitLine+"\n"+
@@ -4369,14 +4372,20 @@ async function checkResult(userId, chatId, target, predicted, predType, placedBe
             : b.type === "SIZE" && b.val === actualSize);
         if (cfg.mode === "COMBINED" || cfg.mode === "COLOR_NUMBER") {
             const predictedSize = evaluationBets.find(b => b.type === "SIZE")?.val || "-";
-            const predictedNumber = evaluationBets.find(b => b.type === "NUMBER")?.val;
+            const predictedColor = evaluationBets.find(b => b.type === "COLOR")?.val || "-";
+            const predictedNumbers = evaluationBets.filter(b => b.type === "NUMBER").map(b => b.val);
+            const predictedNumber = predictedNumbers[0];
             const sizeStatus = sizeMatched ? "WIN ✅" : "LOSS ❌";
+            const colorStatus = colorMatched ? "WIN ✅" : "LOSS ❌";
             const numberStatus = numberMatched ? "WIN ✅" : "LOSS ❌";
             await send(chatId,
                 (cfg.mode === "COLOR_NUMBER" ? "🎨 COLOR+NUMBER RESULT\n" : "🎮 COMBINED RESULT\n") +
                 `Period: ${target}\n` +
-                `Size: ${predictedSize} → ${actualSize} (${sizeStatus})\n` +
-                `Number: ${predictedNumber ?? "-"} → ${num} (${numberStatus})\n` +
+                (cfg.mode === "COLOR_NUMBER"
+                    ? `Color: ${predictedColor} → ${actualColor} (${colorStatus})\n` +
+                      `Numbers: ${predictedNumbers.join(",") || "-"} → ${num} (${numberStatus})\n`
+                    : `Size: ${predictedSize} → ${actualSize} (${sizeStatus})\n` +
+                      `Number: ${predictedNumber ?? "-"} → ${num} (${numberStatus})\n`) +
                 `Overall: ${win ? "WIN ✅" : "LOSS ❌"}`
             );
         }
