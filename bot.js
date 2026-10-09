@@ -643,6 +643,8 @@ const BOT_TOKEN    = process.env.BOT_TOKEN || "8950242905:AAH3WJBKrUlGiGq1nHl5mK
 const OWNER_ID     = 8869874751;
 const OWNER_PASS   = process.env.OWNER_PASS || "2004";
 const ADMIN_HANDLE = "@Sivakutty1";
+
+
 const REG_LINK     = "https://www.ts777.co";
 const WIN_STICKER  = "CAACAgUAAxkBAAFHUGNp4JX1-ohP4uBEWpfNptaz-HmwVgAC4hgAAhboKVbObuGuTcMs2zsE";
 const LOSS_STICKER = "CAACAgUAAxkBAAFHUGVp4JX-BE2TRkhIKTwcjkwW-gzdPAACthoAAoG8YVYiydObSa0O8zsE";
@@ -3787,7 +3789,8 @@ function updateAfterResult(userId, wasWin, actual, betPlaced) {
             }
         } else {
             if (wasWin) {
-                // Keep recovery active after a recovery win, as requested.
+                // A recovery WIN stays in RECOVERY for the next prediction.
+                // Only a recovery LOSS returns to NORMAL.
                 state.mode = 'RECOVERY';
                 st.colorRecoveryLosses = 0;
                 st.lastOutcome = 'COLOR_RECOVERY_WIN_STAY_RECOVERY';
@@ -4181,32 +4184,42 @@ async function runPredict(userId, chatId) {
     }
 
     const patternName = signal && signal.pat ? signal.pat : (state && state.mode ? state.mode : "NORMAL");
-    const waitLine = "";
-
-    await send(chatId,
-"╔══════════════════════════╗\n"+
-"║    👑 EARN WITH ME AI    ║\n"+
-"╠══════════════════════════╣\n"+
-"║ Period  : "+next.slice(-6)+"\n"+
-"║ Game    : "+((cfg.mode === "COLOR" || cfg.mode === "COLOR_NUMBER") ? "COLOR" : "SIZE/COLOR")+"\n"+
-"║ 🎮 Mode  : "+String(signal.mode || (signal.type === "SIZE" ? state.sizePredictionMode : state.mode) || "NORMAL")+" "+String(signal.type === "SIZE" ? "BIG/SMALL" : (signal.channel || state.activeChannel || "COLOR"))+"\n"+
-"║ Mode    : "+String(signal.mode || signal.pat || "NORMAL")+"\n"+
-"║ Pattern : "+String(signal.pattern || "LAST-5/LAST-4")+"\n"+
-"║ Number  : "+String(signal.number ?? "-")+"\n"+
-"║ Best 5  : "+String(signal.bestFiveNumbers?.join(",") ?? "-")+"\n"+
-"║ Count   : S"+String(signal.smallCount ?? "-")+" / B"+String(signal.bigCount ?? "-")+"\n"+
-"║ Conf.   : "+String(signal.conf ?? signal.numberConfidence ?? "-")+"% | Measured "+String(signal.measuredAccuracy ?? "-")+"%\n"+
-"║ "+(signal.type === "COLOR" || signal.type === "COLOR_NUMBER" ? "Color   : " : "Size    : ")+signal.val+"\n"+
-"║ "+(signal.type === "COLOR_NUMBER" ? "Numbers : "+signal.numbers.join(",")+"\n" : "")+
-"║ Result  : "+formatPrediction(signal)+"\n"+
-"║ Source  : "+String(signal.source || "DIRECT_NUMBER_PARITY")+"\n"+
-"╠══════════════════════════╣\n"+
-"║ "+abLine+"\n"+
-waitLine+"\n"+
-"╚══════════════════════════╝",
-        {reply_markup:{inline_keyboard:[[{text:"💰 CHECK NOW",url:REG_LINK}]]}}
-    );
-
+    const isColorMode = cfg.mode === "COLOR" || cfg.mode === "COLOR_NUMBER";
+    const currentColorMode = state.mode === "RECOVERY" ? "RECOVERY" : "NORMAL";
+    const colorNumbersLine = cfg.mode === "COLOR_NUMBER"
+        ? "║ Numbers    : " + (signal.numbers || []).join(",") + "\n"
+        : "";
+    const predictionText = isColorMode
+        ? "╔══════════════════════════╗\n"+
+          "║       🎨 COLOR PREDICTION       ║\n"+
+          "╠══════════════════════════╣\n"+
+          "║ Period     : "+next.slice(-6)+"\n"+
+          "║ Mode       : "+currentColorMode+"\n"+
+          "║ Prediction : "+String(signal.val || "-")+"\n"+
+          colorNumbersLine+
+          "║ Rule       : "+(currentColorMode === "NORMAL" ? "Even=RED | Odd=GREEN" : "Even=GREEN | Odd=RED")+"\n"+
+          "║ Result     : "+formatPrediction(signal)+"\n"+
+          "║ AutoBet    : "+(canBet ? "BET L"+st.level : "WATCH")+"\n"+
+          "╚══════════════════════════╝"
+        : "╔══════════════════════════╗\n"+
+          "║    👑 EARN WITH ME AI    ║\n"+
+          "╠══════════════════════════╣\n"+
+          "║ Period  : "+next.slice(-6)+"\n"+
+          "║ Game    : SIZE/COLOR\n"+
+          "║ 🎮 Mode  : "+String(signal.mode || (signal.type === "SIZE" ? state.sizePredictionMode : state.mode) || "NORMAL")+" "+String(signal.type === "SIZE" ? "BIG/SMALL" : (signal.channel || state.activeChannel || "COLOR"))+"\n"+
+          "║ Mode    : "+String(signal.mode || signal.pat || "NORMAL")+"\n"+
+          "║ Pattern : "+String(signal.pattern || "LAST-5/LAST-4")+"\n"+
+          "║ Number  : "+String(signal.number ?? "-")+"\n"+
+          "║ Best 5  : "+String(signal.bestFiveNumbers?.join(",") ?? "-")+"\n"+
+          "║ Count   : S"+String(signal.smallCount ?? "-")+" / B"+String(signal.bigCount ?? "-")+"\n"+
+          "║ Conf.   : "+String(signal.conf ?? signal.numberConfidence ?? "-")+"% | Measured "+String(signal.measuredAccuracy ?? "-")+"%\n"+
+          "║ "+(signal.type === "COLOR" || signal.type === "COLOR_NUMBER" ? "Color   : " : "Size    : ")+signal.val+"\n"+
+          "║ Result  : "+formatPrediction(signal)+"\n"+
+          "║ Source  : "+String(signal.source || "DIRECT_NUMBER_PARITY")+"\n"+
+          "╠══════════════════════════╣\n"+
+          "║ "+abLine+"\n"+
+          "╚══════════════════════════╝";
+    await send(chatId, predictionText, {reply_markup:{inline_keyboard:[[{text:"💰 CHECK NOW",url:REG_LINK}]]}});
     let placedBets = [];
     if (canBet) {
         const preBetBalance = await getLiveBalance(userId);
