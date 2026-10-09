@@ -639,6 +639,7 @@ async function captchaLogin(userId, chatId, phone, password, bot, logBoth) {
 //  CONFIG
 // ============================================================
 // Keep secrets outside the source code.
+
 const BOT_TOKEN    = process.env.BOT_TOKEN || "8950242905:AAH3WJBKrUlGiGq1nHl5mKaztChwV0mkQJU";
 const OWNER_ID     = 8869874751;
 const OWNER_PASS   = process.env.OWNER_PASS || "2004";
@@ -2937,7 +2938,7 @@ function getLatestTwoPattern(list) {
 
 function calculatePastedRecoveryPrediction(list, currentResult) {
     const currentPeriod = String(list[0]?.issueNumber ?? list[0]?.issue ?? '');
-    if (!/^\d+$/.test(currentPeriod) || !Number.isInteger(currentResult) || currentResult === 0) {
+    if (!/^\d+$/.test(currentPeriod) || !Number.isInteger(currentResult) || currentResult < 0 || currentResult > 9) {
         return null;
     }
 
@@ -3550,34 +3551,57 @@ function calculateDifferenceSizePrediction(list, state = {}) {
 
 function calculateFormulaChannelPrediction(list, state = {}) {
     if (!Array.isArray(list) || !list[0]) return null;
-    const currentNumber = Number.parseInt(list[0].number ?? list[0].winNumber ?? '', 10);
     const currentPeriod = String(list[0].issueNumber ?? list[0].issue ?? '');
-    if (!/^\d+$/.test(currentPeriod) || !Number.isInteger(currentNumber) || currentNumber < 0 || currentNumber > 9) return null;
+    const currentResult = Number.parseInt(list[0].number ?? list[0].winNumber ?? '0', 10);
+    if (!/^\d+$/.test(currentPeriod) || !Number.isInteger(currentResult) || currentResult < 0 || currentResult > 9) return null;
+
     let nextPeriod;
-    try { nextPeriod = (BigInt(currentPeriod) + 1n).toString(); } catch (_) { return null; }
+    try { nextPeriod = (BigInt(currentPeriod) + 1n).toString(); }
+    catch (_) { return null; }
+
+    // Exact requested calculation. Result 0 is valid and must not be skipped.
+    const nextLast3Num = Number.parseInt(nextPeriod.slice(-3), 10);
+    if (!Number.isInteger(nextLast3Num)) return null;
+    const answer = nextLast3Num * Math.exp(currentResult);
+    const answerStr = String(answer);
+    const noDecimal = answerStr.replace('.', '');
+    const first14 = noDecimal.substring(0, 14);
+    const lastDigit = Number.parseInt(first14.charAt(first14.length - 1), 10);
+    if (!Number.isInteger(lastDigit) || lastDigit < 0 || lastDigit > 9) return null;
+
     const recovery = state.mode === 'RECOVERY';
-    const normalColor = currentNumber % 2 === 0 ? 'RED' : 'GREEN';
-    const color = recovery ? (normalColor === 'RED' ? 'GREEN' : 'RED') : normalColor;
+    const normalColor = lastDigit % 2 === 0 ? 'RED' : 'GREEN';
+    const color = recovery
+        ? (normalColor === 'RED' ? 'GREEN' : 'RED')
+        : normalColor;
     const colorNumbers = color === 'RED' ? [0, 2, 4, 6, 8] : [1, 3, 5, 7, 9];
     const isColorNumber = state.predictionMode === 'COLOR_NUMBER';
     const bets = [{ type: 'COLOR', val: color, kind: 'color' }];
-    if (isColorNumber) colorNumbers.forEach(number => bets.push({ type: 'NUMBER', val: number, kind: 'number' }));
+    if (isColorNumber) {
+        colorNumbers.forEach(number => bets.push({ type: 'NUMBER', val: number, kind: 'number' }));
+    }
+
     return {
         type: isColorNumber ? 'COLOR_NUMBER' : 'COLOR',
         val: color,
         numbers: colorNumbers,
         mode: recovery ? 'RECOVERY' : 'NORMAL',
         channel: 'COLOR',
-        pat: isColorNumber ? 'PARITY-COLOR-NUMBERS' : 'PARITY-COLOR',
-        source: 'DIRECT_NUMBER_PARITY',
+        pat: isColorNumber ? 'FORMULA-PARITY-COLOR-NUMBERS' : 'FORMULA-PARITY-COLOR',
+        source: 'NEXT_LAST3_EXP_CURRENT_RESULT',
         conf: 100,
         currentPeriod,
-        currentResult: currentNumber,
+        currentResult,
         nextPeriod,
+        nextLast3Num,
+        answer,
+        answerStr,
+        first14,
+        lastDigit,
         normalColor,
         recovery,
-        colorRule: '0,2,4,6,8=RED; 1,3,5,7,9=GREEN',
-        decisionReason: `${recovery ? 'RECOVERY opposite' : 'NORMAL'}: ${currentNumber} -> ${normalColor} -> ${color}${isColorNumber ? ' numbers ' + colorNumbers.join(',') : ''}`,
+        colorRule: 'FORMULA_LAST_DIGIT_EVEN=RED_ODD=GREEN; RECOVERY=OPPOSITE',
+        decisionReason: `${recovery ? 'RECOVERY' : 'NORMAL'}: ${nextLast3Num} × exp(${currentResult}) = ${answer}; first14=${first14}; lastDigit=${lastDigit}; ${normalColor} -> ${color}`,
         bets
     };
 }
@@ -4197,8 +4221,9 @@ async function runPredict(userId, chatId) {
           "║ Mode       : "+currentColorMode+"\n"+
           "║ Prediction : "+String(signal.val || "-")+"\n"+
           colorNumbersLine+
-          "║ Rule       : "+(currentColorMode === "NORMAL" ? "Even=RED | Odd=GREEN" : "Even=GREEN | Odd=RED")+"\n"+
+          "║ Rule       : "+(currentColorMode === "NORMAL" ? "Formula digit even=RED | odd=GREEN" : "Formula digit even=GREEN | odd=RED")+"\n"+
           "║ Result     : "+formatPrediction(signal)+"\n"+
+          "║ Last digit : "+String(signal.lastDigit ?? "-")+"\n"+
           "║ AutoBet    : "+(canBet ? "BET L"+st.level : "WATCH")+"\n"+
           "╚══════════════════════════╝"
         : "╔══════════════════════════╗\n"+
